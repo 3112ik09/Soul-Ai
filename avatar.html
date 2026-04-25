@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Siri — Live2D</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body {
+  width:100%; height:100%;
+  background: #07090f;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  font-family: 'Segoe UI', sans-serif;
+}
+
+/* Fixed canvas container — 480x640 portrait */
+#canvas-wrap {
+  position: relative;
+  width: 480px;
+  height: 640px;
+  overflow: hidden;
+  border-radius: 16px;
+  background: #07090f;
+}
+
+#canvas {
+  position: absolute;
+  top: 0; left: 0;
+}
+
+/* HUD below canvas */
+#hud {
+  margin-top: 14px;
+  display: flex; flex-direction: column;
+  align-items: center; gap: 7px;
+}
+#nameplate {
+  display:flex; align-items:center; gap:8px;
+  color:rgba(160,200,255,.55);
+  font-size:11px; letter-spacing:.18em; text-transform:uppercase;
+}
+#dot {
+  width:6px; height:6px; border-radius:50%;
+  background:#4a7aff; box-shadow:0 0 6px #4a7aff;
+  transition:all .4s;
+}
+#dot.talk  { background:#34d399; box-shadow:0 0 8px #34d399; animation:dp .5s infinite alternate; }
+#dot.think { background:#fbbf24; box-shadow:0 0 8px #fbbf24; animation:dp 1s  infinite alternate; }
+@keyframes dp { to{opacity:.15} }
+#subtitle {
+  max-width:460px; text-align:center;
+  font-size:12px; color:rgba(200,220,255,.45);
+  line-height:1.6; min-height:28px;
+  background:rgba(0,0,0,.35);
+  padding:5px 16px; border-radius:16px;
+}
+#elabel {
+  font-size:9px; color:rgba(100,140,255,.2);
+  letter-spacing:.14em; text-transform:uppercase;
+}
+#conn {
+  position:fixed; top:12px; right:14px;
+  font-size:9px; color:rgba(80,120,255,.18);
+  letter-spacing:.08em;
+}
+#conn.ok { color:rgba(80,180,255,.45); }
+#hint {
+  position:fixed; bottom:6px;
+  font-size:8px; color:rgba(255,255,255,.05);
+  letter-spacing:.08em;
+}
+
+/* Loading */
+#loading {
+  position:absolute; inset:0;
+  background:#07090f;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:14px; z-index:100;
+  border-radius:16px;
+  transition:opacity .5s;
+}
+#loading p { color:rgba(160,200,255,.5); font-size:12px; letter-spacing:.1em; }
+#bar-wrap { width:160px; height:2px; background:rgba(255,255,255,.08); border-radius:2px; overflow:hidden; }
+#bar { height:100%; width:0%; background:linear-gradient(90deg,#4a7aff,#34d399); border-radius:2px; transition:width .3s; }
+</style>
+</head>
+<body>
+
+<!-- Fixed size canvas container -->
+<div id="canvas-wrap">
+  <div id="loading">
+    <p id="load-msg">Loading Changli...</p>
+    <div id="bar-wrap"><div id="bar"></div></div>
+  </div>
+  <canvas id="canvas" width="480" height="640"></canvas>
+</div>
+
+<!-- HUD below -->
+<div id="hud">
+  <div id="nameplate"><div id="dot"></div><span>Siri</span></div>
+  <div id="subtitle">...</div>
+  <div id="elabel">idle</div>
+</div>
+
+<div id="conn">connecting...</div>
+<div id="hint">1=neutral · 2=happy · 3=thinking · 4=surprised · 5=annoyed · T=talk</div>
+
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.2/dist/browser/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+
+<script>
+// ── Canvas dimensions ──────────────────────────────────────────
+const CW = 480;   // canvas width
+const CH = 640;   // canvas height
+
+// ── Config ─────────────────────────────────────────────────────
+const MODEL_PATH = './live2d/长离带水印/长离.model3.json';
+const WS_URL     = 'ws://localhost:8765';
+
+const EXPR_MAP = {
+  happy:     '爱心眼',
+  annoyed:   '生气',
+  thinking:  '白眼',
+  surprised: '脸红',
+  neutral:   null,
+};
+
+// ── State ──────────────────────────────────────────────────────
+const S = { emotion:'neutral', talking:false, mouth:0 };
+
+// ── PIXI — fixed size ──────────────────────────────────────────
+const app = new PIXI.Application({
+  view:            document.getElementById('canvas'),
+  width:           CW,
+  height:          CH,
+  autoStart:       true,
+  backgroundColor: 0x07090f,
+  antialias:       true,
+});
+
+window.PIXI = PIXI;
+const Live2DModel = window.PIXI.live2d?.Live2DModel || window.Live2DModel;
+if (Live2DModel) Live2DModel.registerTicker(PIXI.Ticker);
+
+let model = null;
+let clock  = 0;
+
+// ── Load model ─────────────────────────────────────────────────
+async function loadModel() {
+  bar(15);
+  try {
+    const Cls = window.PIXI?.live2d?.Live2DModel || window.Live2DModel;
+    const m   = await Cls.from(MODEL_PATH, { onLoad: () => bar(60) });
+    bar(85);
+
+    // Scale model so its WIDTH fits the canvas
+    // This gives us control — we then shift Y to show the face
+    // Zoom in 1.8x so face fills canvas nicely
+    const scale = CW / m.width * 1.8;
+    m.scale.set(scale);
+
+    m.anchor.set(0.5, 0);
+
+    // Shift up so face+chest is in viewport
+    // At 1.8x scale, face is roughly top 0-40% of model
+    // We shift up by 10% of modelH so face top aligns with canvas top
+    const modelH = m.height * scale;
+    m.position.set(CW / 2, -modelH * 0.08);
+
+    m.interactive = true;
+    app.stage.addChild(m);
+    model = m;
+
+    safeMotion('idle');
+    bar(100);
+    setTimeout(hideLoad, 500);
+    app.ticker.add(tick);
+
+    console.log(`✅ Model loaded — size: ${m.width}x${m.height}, scale: ${scale.toFixed(2)}, modelH: ${modelH.toFixed(0)}px`);
+
+  } catch(err) {
+    console.error('Load error:', err);
+    document.getElementById('load-msg').textContent = '❌ Failed — check console';
+  }
+}
+
+// ── Tick ───────────────────────────────────────────────────────
+function tick(dt) {
+  if (!model) return;
+  clock += dt * 0.01;
+  const core = model.internalModel.coreModel;
+
+  // Mouth
+  if (S.talking) {
+    S.mouth = 0.35 + Math.sin(clock*18)*0.32 + Math.sin(clock*27)*0.14;
+    S.mouth = Math.max(0.08, Math.min(1.0, S.mouth));
+  } else {
+    S.mouth *= 0.78;
+  }
+  safeParam(core, 'ParamMouthOpenY', S.mouth);
+
+  // Head idle
+  if (!S.talking) {
+    safeParam(core, 'ParamAngleX', Math.sin(clock*0.22)*14 + Math.sin(clock*0.13)*6);
+    safeParam(core, 'ParamAngleY', Math.cos(clock*0.18)*7  + Math.cos(clock*0.31)*3);
+  } else {
+    safeParam(core, 'ParamAngleX', Math.sin(clock*4)*3);
+    safeParam(core, 'ParamAngleY', Math.sin(clock*3)*2);
+  }
+
+  // Thinking tilt
+  safeParam(core, 'ParamAngleZ', S.emotion==='thinking' ? Math.sin(clock*0.9)*10 : 0);
+
+  // Breathing + body
+  safeParam(core, 'ParamBreath',     (Math.sin(clock*0.5)+1)/2);
+  safeParam(core, 'ParamBodyAngleX', Math.sin(clock*0.24)*5);
+  safeParam(core, 'ParamBodyAngleZ', Math.sin(clock*0.18)*3);
+
+  // Eye wander
+  safeParam(core, 'ParamEyeBallX', Math.sin(clock*0.32)*0.4);
+  safeParam(core, 'ParamEyeBallY', Math.cos(clock*0.26)*0.3);
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+function safeParam(core, id, val) { try { core.setParameterValueById(id, val); } catch(_) {} }
+function safeExpr(name) {
+  if (!model) return;
+  try { name ? model.expression(name) : model.expression(); } catch(_) {}
+}
+function safeMotion(g) { if (!model) return; try { model.motion(g); } catch(_) {} }
+function bar(p) { document.getElementById('bar').style.width = p+'%'; }
+function hideLoad() {
+  const el = document.getElementById('loading');
+  el.style.opacity='0';
+  setTimeout(()=>el.remove(), 500);
+}
+
+// ── UI ─────────────────────────────────────────────────────────
+const dot = document.getElementById('dot');
+const lab = document.getElementById('elabel');
+const sub = document.getElementById('subtitle');
+const con = document.getElementById('conn');
+
+function setEmotion(name) {
+  if (!EXPR_MAP.hasOwnProperty(name)) return;
+  S.emotion = name; lab.textContent = name;
+  safeExpr(EXPR_MAP[name]);
+}
+function setTalking(val) {
+  S.talking = val;
+  dot.className = val ? 'talk' : (S.emotion==='thinking'?'think':'');
+  val ? safeMotion('talk') : safeMotion('idle');
+}
+function setSub(text) { sub.textContent = text||'...'; }
+
+// ── WebSocket ──────────────────────────────────────────────────
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen    = ()=>{ con.textContent='connected'; con.className='ok'; };
+  ws.onmessage = (ev)=>{
+    try {
+      const m=JSON.parse(ev.data);
+      if(m.type==='state'){
+        if(m.emotion) setEmotion(m.emotion);
+        if(typeof m.talking!=='undefined') setTalking(m.talking);
+        if(m.text!==undefined) setSub(m.text);
+      }
+    }catch(_){}
+  };
+  ws.onclose = ()=>{ con.textContent='disconnected'; con.className=''; setTalking(false); setTimeout(connect,2000); };
+  ws.onerror  = ()=> ws.close();
+}
+
+// ── Keys ───────────────────────────────────────────────────────
+document.addEventListener('keydown', ev=>({
+  '1':()=>{ setEmotion('neutral');   setTalking(false); },
+  '2':()=>{ setEmotion('happy');     setTalking(false); },
+  '3':()=>{ setEmotion('thinking');  setTalking(false); dot.className='think'; },
+  '4':()=>{ setEmotion('surprised'); setTalking(false); },
+  '5':()=>{ setEmotion('annoyed');   setTalking(false); },
+  't':()=> setTalking(!S.talking),
+})[ev.key]?.());
+
+// ── Boot ───────────────────────────────────────────────────────
+loadModel();
+connect();
+</script>
+</body>
+</html>

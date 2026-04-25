@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Siri — Live2D</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body {
+  width:100%; height:100%;
+  background: #07090f;
+  overflow: hidden;
+  font-family: 'Segoe UI', sans-serif;
+}
+#canvas {
+  position: fixed;
+  top:0; left:0;
+  width:100%; height:100%;
+}
+
+/* HUD */
+#hud {
+  position: fixed;
+  bottom: 28px; left: 50%;
+  transform: translateX(-50%);
+  display: flex; flex-direction: column;
+  align-items: center; gap: 7px;
+  pointer-events: none; z-index: 10;
+}
+#nameplate {
+  display:flex; align-items:center; gap:8px;
+  color:rgba(160,200,255,.55);
+  font-size:11px; letter-spacing:.18em; text-transform:uppercase;
+}
+#dot {
+  width:6px; height:6px; border-radius:50%;
+  background:#4a7aff; box-shadow:0 0 6px #4a7aff;
+  transition:all .4s;
+}
+#dot.talk  { background:#34d399; box-shadow:0 0 8px #34d399; animation:dp .5s infinite alternate; }
+#dot.think { background:#fbbf24; box-shadow:0 0 8px #fbbf24; animation:dp 1s  infinite alternate; }
+@keyframes dp { to{opacity:.15} }
+#subtitle {
+  max-width:500px; text-align:center;
+  font-size:13px; color:rgba(200,220,255,.5);
+  line-height:1.6; min-height:30px;
+  background:rgba(0,0,0,.4);
+  padding:6px 18px; border-radius:20px;
+  backdrop-filter:blur(8px);
+}
+#elabel {
+  font-size:9px; color:rgba(100,140,255,.2);
+  letter-spacing:.14em; text-transform:uppercase;
+}
+#conn {
+  position:fixed; top:12px; right:14px;
+  font-size:9px; color:rgba(80,120,255,.18);
+  letter-spacing:.08em; z-index:10;
+}
+#conn.ok { color:rgba(80,180,255,.45); }
+#hint {
+  position:fixed; bottom:6px;
+  font-size:8px; color:rgba(255,255,255,.05);
+  letter-spacing:.08em; z-index:10;
+}
+
+/* Loading */
+#loading {
+  position:fixed; inset:0;
+  background:#07090f;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  gap:16px; z-index:100;
+  transition:opacity .5s;
+}
+#loading p { color:rgba(160,200,255,.5); font-size:13px; letter-spacing:.12em; }
+#bar-wrap { width:200px; height:3px; background:rgba(255,255,255,.08); border-radius:2px; overflow:hidden; }
+#bar { height:100%; width:0%; background:linear-gradient(90deg,#4a7aff,#34d399); border-radius:2px; transition:width .3s; }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <p id="load-msg">Loading Changli...</p>
+  <div id="bar-wrap"><div id="bar"></div></div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<div id="hud">
+  <div id="nameplate"><div id="dot"></div><span>Siri</span></div>
+  <div id="subtitle">...</div>
+  <div id="elabel">idle</div>
+</div>
+
+<div id="conn">connecting...</div>
+<div id="hint">1=neutral · 2=happy · 3=thinking · 4=surprised · 5=annoyed · T=talk</div>
+
+<!-- Cubism Core (must load first) -->
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<!-- PIXI v6 exact version that pixi-live2d-display needs -->
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.2/dist/browser/pixi.min.js"></script>
+<!-- pixi-live2d-display -->
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+
+<script>
+// ── Config ─────────────────────────────────────────────────────
+const MODEL_PATH = './live2d/长离带水印/长离.model3.json';
+const WS_URL     = 'ws://localhost:8765';
+
+// Map emotion names → expression names inside the model
+// EXP3 files found: 脸红(blush) 生气(angry) 白眼(eyeroll) 眼罩 爱心眼(hearteyes) 外套穿脱
+const EXPR_MAP = {
+  happy:     '爱心眼',   // heart eyes
+  annoyed:   '生气',     // angry
+  thinking:  '白眼',     // eye roll
+  surprised: '脸红',     // blush
+  neutral:   null,       // reset to default
+};
+
+// ── State ──────────────────────────────────────────────────────
+const S = { emotion:'neutral', talking:false, mouth:0 };
+
+// ── PIXI App ───────────────────────────────────────────────────
+const app = new PIXI.Application({
+  view:            document.getElementById('canvas'),
+  autoStart:       true,
+  resizeTo:        window,
+  backgroundColor: 0x07090f,
+  antialias:       true,
+});
+
+// Register Live2D ticker
+window.PIXI = PIXI;
+const Live2DModel = window.PIXI.live2d?.Live2DModel || window.Live2DModel;
+if (Live2DModel) Live2DModel.registerTicker(PIXI.Ticker);
+
+let model = null;
+let clock  = 0;
+
+// ── Load model ─────────────────────────────────────────────────
+async function loadModel() {
+  bar(15);
+  try {
+    const Live2DModelClass = window.PIXI?.live2d?.Live2DModel || window.Live2DModel;
+    const m = await Live2DModelClass.from(MODEL_PATH, {
+      onLoad: () => bar(60),
+    });
+    bar(85);
+
+    // Show face + upper body — scale up, anchor to top
+    const scale = Math.max(
+      window.innerWidth  / m.width  * 1.2,
+      window.innerHeight / m.height * 1.6
+    );
+
+    m.scale.set(scale);
+    m.anchor.set(0.5, 0);   // anchor top center
+    // Position so face is visible at top
+    m.position.set(window.innerWidth / 2, -m.height * scale * 0.42);
+    m.interactive = true;   // enables mouse tracking
+
+    app.stage.addChild(m);
+    model = m;
+
+    // Try to play idle motion
+    safeMotion('idle');
+
+    bar(100);
+    setTimeout(hideLoad, 500);
+
+    // Resize handler
+    window.addEventListener('resize', () => {
+      const s = Math.max(
+        window.innerWidth  / m.width  * 1.2,
+        window.innerHeight / m.height * 1.6
+      );
+      m.scale.set(s);
+      m.anchor.set(0.5, 0);
+      m.position.set(window.innerWidth/2, -m.height * s * 0.42);
+    });
+
+    // Start animation
+    app.ticker.add(tick);
+    console.log('✅ Changli loaded');
+
+  } catch(err) {
+    console.error('Model load error:', err);
+    document.getElementById('load-msg').textContent = '❌ Failed — check console';
+  }
+}
+
+// ── Tick — drives parameters every frame ───────────────────────
+function tick(dt) {
+  if (!model) return;
+  clock += dt * 0.01;
+
+  const core = model.internalModel.coreModel;
+
+  // Mouth open — lip sync
+  if (S.talking) {
+    S.mouth = 0.35 + Math.sin(clock*18)*0.32 + Math.sin(clock*27)*0.14;
+    S.mouth = Math.max(0.08, Math.min(1.0, S.mouth));
+  } else {
+    S.mouth *= 0.78;
+  }
+  safeParam(core, 'ParamMouthOpenY', S.mouth);
+
+  // Head idle sway — natural looking movement
+  if (!S.talking) {
+    safeParam(core, 'ParamAngleX', Math.sin(clock*0.22)*14 + Math.sin(clock*0.13)*6);
+    safeParam(core, 'ParamAngleY', Math.cos(clock*0.18)*7  + Math.cos(clock*0.31)*3);
+  } else {
+    // Subtle nod while talking
+    safeParam(core, 'ParamAngleX', Math.sin(clock*4)*3);
+    safeParam(core, 'ParamAngleY', Math.sin(clock*3)*2);
+  }
+
+  // Thinking tilt
+  if (S.emotion === 'thinking') {
+    safeParam(core, 'ParamAngleZ', Math.sin(clock*0.9)*10);
+  } else {
+    safeParam(core, 'ParamAngleZ', 0);
+  }
+
+  // Breathing
+  safeParam(core, 'ParamBreath', (Math.sin(clock*0.5)+1)/2);
+
+  // Body sway
+  safeParam(core, 'ParamBodyAngleX', Math.sin(clock*0.24)*5);
+  safeParam(core, 'ParamBodyAngleZ', Math.sin(clock*0.18)*3);
+
+  // Eye wander (subtle)
+  safeParam(core, 'ParamEyeBallX', Math.sin(clock*0.32)*0.4);
+  safeParam(core, 'ParamEyeBallY', Math.cos(clock*0.26)*0.3);
+}
+
+// ── Safe helpers ───────────────────────────────────────────────
+function safeParam(core, id, val) {
+  try { core.setParameterValueById(id, val); } catch(_) {}
+}
+function safeExpr(name) {
+  if (!model) return;
+  try {
+    if (name) model.expression(name);
+    else      model.expression();   // reset
+  } catch(e) { console.warn('Expr not found:', name); }
+}
+function safeMotion(group) {
+  if (!model) return;
+  try { model.motion(group); } catch(_) {}
+}
+
+// ── Loading bar ────────────────────────────────────────────────
+function bar(pct) { document.getElementById('bar').style.width = pct+'%'; }
+function hideLoad() {
+  const el = document.getElementById('loading');
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 500);
+}
+
+// ── UI ─────────────────────────────────────────────────────────
+const dot = document.getElementById('dot');
+const lab = document.getElementById('elabel');
+const sub = document.getElementById('subtitle');
+const con = document.getElementById('conn');
+
+function setEmotion(name) {
+  if (!name || !EXPR_MAP.hasOwnProperty(name)) return;
+  S.emotion = name;
+  lab.textContent = name;
+  safeExpr(EXPR_MAP[name]);
+}
+
+function setTalking(val) {
+  S.talking = val;
+  dot.className = val ? 'talk' : (S.emotion==='thinking' ? 'think' : '');
+  if (val) safeMotion('talk');
+  else     safeMotion('idle');
+}
+
+function setSub(text) { sub.textContent = text || '...'; }
+
+// ── WebSocket ──────────────────────────────────────────────────
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen    = () => { con.textContent='connected'; con.className='ok'; };
+  ws.onmessage = (ev) => {
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'state') {
+        if (m.emotion)                       setEmotion(m.emotion);
+        if (typeof m.talking !== 'undefined') setTalking(m.talking);
+        if (m.text !== undefined)            setSub(m.text);
+      }
+    } catch(_) {}
+  };
+  ws.onclose = () => {
+    con.textContent='disconnected — retrying'; con.className='';
+    setTalking(false); setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ── Keys ───────────────────────────────────────────────────────
+document.addEventListener('keydown', ev => ({
+  '1': () => { setEmotion('neutral');   setTalking(false); },
+  '2': () => { setEmotion('happy');     setTalking(false); },
+  '3': () => { setEmotion('thinking');  setTalking(false); dot.className='think'; },
+  '4': () => { setEmotion('surprised'); setTalking(false); },
+  '5': () => { setEmotion('annoyed');   setTalking(false); },
+  't': () => setTalking(!S.talking),
+})[ev.key]?.());
+
+// ── Boot ───────────────────────────────────────────────────────
+loadModel();
+connect();
+</script>
+</body>
+</html>
