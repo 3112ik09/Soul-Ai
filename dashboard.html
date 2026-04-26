@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Siri Dashboard</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.2/dist/browser/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg:      #0d1117;
+  --surface: #161b22;
+  --border:  #30363d;
+  --text:    #e6edf3;
+  --muted:   rgba(230,237,243,.4);
+  --accent:  #4a7aff;
+  --green:   #34d399;
+  --yellow:  #fbbf24;
+}
+html, body {
+  width:100%; height:100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', sans-serif;
+  overflow: hidden;
+}
+
+#app {
+  display: grid;
+  grid-template-rows: 1fr 280px;
+  grid-template-columns: 1fr;
+  height: 100vh;
+  gap: 0;
+}
+
+#top {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  border-bottom: 1px solid var(--border);
+  min-height: 0;
+}
+
+/* ── Avatar panel ── */
+#avatar-panel {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  background: #07090f;
+  position: relative;
+  overflow: hidden;
+}
+#avatar-canvas-wrap { width: 420px; height: 100%; overflow: hidden; position: relative; }
+#live2d-canvas { position: absolute; top: 0; left: 0; }
+#avatar-hud {
+  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  pointer-events: none; z-index: 10;
+}
+#nameplate {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11px; letter-spacing: .18em; text-transform: uppercase;
+  color: rgba(160,200,255,.55);
+}
+#status-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 6px var(--accent);
+  transition: all .4s;
+}
+#status-dot.talk  { background: var(--green);  box-shadow: 0 0 8px var(--green);  animation: dp .5s infinite alternate; }
+#status-dot.think { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); animation: dp 1s  infinite alternate; }
+@keyframes dp { to { opacity: .15; } }
+#subtitle-bar {
+  max-width: 380px; text-align: center;
+  font-size: 12px; color: rgba(200,220,255,.5);
+  background: rgba(0,0,0,.45);
+  padding: 5px 14px; border-radius: 14px;
+  min-height: 28px; line-height: 1.5;
+}
+#avatar-loading {
+  position: absolute; inset: 0;
+  background: #07090f;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 12px; z-index: 20;
+}
+#avatar-loading p { font-size: 12px; color: var(--muted); letter-spacing: .1em; }
+#load-bar-wrap { width: 140px; height: 2px; background: rgba(255,255,255,.08); border-radius: 2px; overflow: hidden; }
+#load-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width .3s; }
+
+/* ── Chat panel ── */
+#chat-panel { display: flex; flex-direction: column; min-height: 0; }
+#chat-header {
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--muted);
+  display: flex; align-items: center; justify-content: space-between;
+}
+#clear-btn {
+  font-size: 10px; color: var(--muted);
+  background: none; border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 8px; cursor: pointer;
+  transition: all .2s;
+}
+#clear-btn:hover { color: var(--text); border-color: var(--accent); }
+#chat-log {
+  flex: 1; overflow-y: auto; padding: 12px 16px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+#chat-log::-webkit-scrollbar { width: 4px; }
+#chat-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.msg { display: flex; flex-direction: column; gap: 3px; max-width: 90%; }
+.msg.user { align-self: flex-end; align-items: flex-end; }
+.msg.siri { align-self: flex-start; align-items: flex-start; }
+.msg-label { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.msg-bubble { font-size: 13px; line-height: 1.55; padding: 8px 12px; border-radius: 12px; }
+.msg.user .msg-bubble {
+  background: var(--accent); color: #fff; border-bottom-right-radius: 3px;
+}
+.msg.siri .msg-bubble {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-bottom-left-radius: 3px;
+}
+
+/* ── Bottom output ── */
+#output-panel {
+  border-top: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-height: 0;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg);
+  transition: all .25s ease;
+}
+#code-panel { border-right: 1px solid var(--border); }
+
+.panel-header {
+  padding: 8px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.panel-header:hover { color: var(--text); }
+.panel-header .hint {
+  font-size: 9px; color: rgba(255,255,255,.25);
+  font-weight: normal; letter-spacing: .05em;
+  text-transform: none;
+}
+
+#lang-badge {
+  background: #21262d; border: 1px solid var(--border);
+  border-radius: 10px; padding: 1px 8px; font-size: 9px;
+}
+#copy-btn {
+  background: #238636; color: #fff; border: none; border-radius: 5px;
+  padding: 4px 12px; font-size: 10px; cursor: pointer; transition: background .2s;
+}
+#copy-btn:hover { background: #2ea043; }
+#copy-btn.copied { background: #1a7f37; }
+
+#code-body, #web-body { flex: 1; overflow: auto; padding: 12px 16px; }
+#code-body::-webkit-scrollbar, #web-body::-webkit-scrollbar { width: 4px; }
+#code-body::-webkit-scrollbar-thumb, #web-body::-webkit-scrollbar-thumb { background: var(--border); }
+
+#code-empty, #web-empty {
+  height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--muted);
+  padding: 20px; text-align: center;
+}
+pre { margin: 0; }
+pre code { font-size: 12.5px !important; line-height: 1.65 !important; }
+
+.web-result { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.web-result:last-child { border-bottom: none; }
+.web-result-title {
+  font-size: 13px; color: #58a6ff; cursor: pointer; text-decoration: none;
+  display: block; margin-bottom: 3px;
+}
+.web-result-title:hover { text-decoration: underline; }
+.web-result-url { font-size: 10px; color: var(--muted); margin-bottom: 4px; word-break: break-all; }
+.web-result-snippet { font-size: 12px; color: rgba(230,237,243,.6); line-height: 1.5; }
+
+/* ── FULLSCREEN MODE ── */
+.panel.fullscreen {
+  position: fixed !important;
+  top: 0; left: 0; right: 0; bottom: 22px;
+  z-index: 999;
+  border: none;
+  box-shadow: 0 0 60px rgba(0,0,0,.8);
+}
+.panel.fullscreen .panel-header {
+  padding: 14px 22px;
+  font-size: 12px;
+}
+.panel.fullscreen #code-body,
+.panel.fullscreen #web-body {
+  padding: 22px 32px;
+  font-size: 14px;
+}
+.panel.fullscreen pre code {
+  font-size: 14.5px !important;
+  line-height: 1.75 !important;
+}
+.panel.fullscreen .web-result-title { font-size: 16px; }
+.panel.fullscreen .web-result-url    { font-size: 11px; }
+.panel.fullscreen .web-result-snippet{ font-size: 13.5px; line-height: 1.6; }
+
+#statusbar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 22px;
+  background: var(--accent);
+  display: flex; align-items: center;
+  padding: 0 14px; gap: 16px;
+  font-size: 10px; color: rgba(255,255,255,.8);
+  letter-spacing: .06em;
+  z-index: 1000;
+}
+#conn-status { margin-left: auto; }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <div id="top">
+    <!-- Avatar -->
+    <div id="avatar-panel">
+      <div id="avatar-loading">
+        <p>Loading Changli...</p>
+        <div id="load-bar-wrap"><div id="load-bar"></div></div>
+      </div>
+      <div id="avatar-canvas-wrap"><canvas id="live2d-canvas"></canvas></div>
+      <div id="avatar-hud">
+        <div id="nameplate">
+          <div id="status-dot"></div>
+          <span>Siri</span>
+        </div>
+        <div id="subtitle-bar">...</div>
+      </div>
+    </div>
+
+    <!-- Chat -->
+    <div id="chat-panel">
+      <div id="chat-header">
+        <span>Chat Log</span>
+        <button id="clear-btn" onclick="clearChat()">Clear</button>
+      </div>
+      <div id="chat-log">
+        <div class="msg siri">
+          <span class="msg-label">Siri</span>
+          <div class="msg-bubble">Hey! Try saying "search for X" or "write code to Y". Click any panel below to expand it.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Output -->
+  <div id="output-panel">
+
+    <div id="code-panel" class="panel">
+      <div class="panel-header" onclick="togglePanel('code-panel')">
+        <span>Code Output <span class="hint">· click to expand</span></span>
+        <div style="display:flex;gap:8px;align-items:center" onclick="event.stopPropagation()">
+          <span id="lang-badge">-</span>
+          <button id="copy-btn" onclick="copyCode()">Copy</button>
+        </div>
+      </div>
+      <div id="code-body">
+        <div id="code-empty">Code will appear here when you ask Siri to write code</div>
+        <pre id="code-pre" style="display:none"><code id="code-content"></code></pre>
+      </div>
+    </div>
+
+    <div id="web-panel" class="panel">
+      <div class="panel-header" onclick="togglePanel('web-panel')">
+        <span>Web Results <span class="hint">· click to expand</span></span>
+      </div>
+      <div id="web-body">
+        <div id="web-empty">Web search results will appear here</div>
+        <div id="web-results"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="statusbar">
+  <span>Siri AI Assistant</span>
+  <span id="elabel">idle</span>
+  <span id="conn-status">connecting...</span>
+</div>
+
+<script>
+const MODEL_PATH = './live2d/长离带水印/长离.model3.json';
+const WS_URL     = 'ws://localhost:8765';
+const EXPR_MAP   = {
+  happy:'爱心眼', annoyed:'生气', thinking:'白眼',
+  surprised:'脸红', neutral:null,
+};
+
+const S = { emotion:'neutral', talking:false, mouth:0 };
+let currentCode = '';
+let model = null, clock = 0;
+
+// ── Fullscreen toggle ──
+function togglePanel(id) {
+  const el = document.getElementById(id);
+  const isFs = el.classList.toggle('fullscreen');
+  // If opening one, close the other
+  if (isFs) {
+    const other = id === 'code-panel' ? 'web-panel' : 'code-panel';
+    document.getElementById(other).classList.remove('fullscreen');
+  }
+}
+
+// Esc to exit fullscreen
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('code-panel').classList.remove('fullscreen');
+    document.getElementById('web-panel').classList.remove('fullscreen');
+  }
+});
+
+// ── Live2D ──
+const CW = 420;
+const app = new PIXI.Application({
+  view:            document.getElementById('live2d-canvas'),
+  width:           CW,
+  height:          window.innerHeight * 0.65,
+  autoStart:       true,
+  backgroundColor: 0x07090f,
+  antialias:       true,
+});
+window.PIXI = PIXI;
+const Live2DModel = window.PIXI.live2d?.Live2DModel || window.Live2DModel;
+if (Live2DModel) Live2DModel.registerTicker(PIXI.Ticker);
+
+async function loadModel() {
+  setLoadBar(15);
+  try {
+    const Cls = window.PIXI?.live2d?.Live2DModel || window.Live2DModel;
+    const m   = await Cls.from(MODEL_PATH, { onLoad: ()=> setLoadBar(60) });
+    setLoadBar(85);
+    const scale = CW / m.width * 1.8;
+    m.scale.set(scale);
+    m.anchor.set(0.5, 0);
+    m.position.set(CW/2, -(m.height * scale * 0.08));
+    m.interactive = true;
+    app.stage.addChild(m);
+    model = m;
+    safeMotion('idle');
+    setLoadBar(100);
+    setTimeout(hideLoader, 400);
+    app.ticker.add(tick);
+  } catch(e) {
+    document.querySelector('#avatar-loading p').textContent = '❌ Model failed';
+    console.error(e);
+  }
+}
+
+function tick(dt) {
+  if (!model) return;
+  clock += dt * 0.01;
+  const core = model.internalModel.coreModel;
+  if (S.talking) {
+    S.mouth = Math.max(0.08, Math.min(1, 0.35 + Math.sin(clock*18)*0.32 + Math.sin(clock*27)*0.14));
+  } else { S.mouth *= 0.78; }
+  safeParam(core, 'ParamMouthOpenY', S.mouth);
+  if (!S.talking) {
+    safeParam(core, 'ParamAngleX', Math.sin(clock*.22)*14 + Math.sin(clock*.13)*6);
+    safeParam(core, 'ParamAngleY', Math.cos(clock*.18)*7  + Math.cos(clock*.31)*3);
+  } else {
+    safeParam(core, 'ParamAngleX', Math.sin(clock*4)*3);
+    safeParam(core, 'ParamAngleY', Math.sin(clock*3)*2);
+  }
+  safeParam(core, 'ParamAngleZ',    S.emotion==='thinking' ? Math.sin(clock*.9)*10 : 0);
+  safeParam(core, 'ParamBreath',    (Math.sin(clock*.5)+1)/2);
+  safeParam(core, 'ParamBodyAngleX', Math.sin(clock*.24)*5);
+  safeParam(core, 'ParamBodyAngleZ', Math.sin(clock*.18)*3);
+  safeParam(core, 'ParamEyeBallX',   Math.sin(clock*.32)*.4);
+  safeParam(core, 'ParamEyeBallY',   Math.cos(clock*.26)*.3);
+}
+function safeParam(c,id,v){ try{c.setParameterValueById(id,v);}catch(_){} }
+function safeExpr(n){ if(!model)return; try{ n?model.expression(n):model.expression(); }catch(_){} }
+function safeMotion(g){ if(!model)return; try{model.motion(g);}catch(_){} }
+function setLoadBar(p){ document.getElementById('load-bar').style.width=p+'%'; }
+function hideLoader(){
+  const el=document.getElementById('avatar-loading');
+  el.style.transition='opacity .5s'; el.style.opacity='0';
+  setTimeout(()=>el.remove(),500);
+}
+
+// ── Chat ──
+function addMessage(role, text) {
+  const log = document.getElementById('chat-log');
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.innerHTML = `
+    <span class="msg-label">${role === 'user' ? 'You' : 'Siri'}</span>
+    <div class="msg-bubble">${escapeHtml(text)}</div>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+function clearChat() { document.getElementById('chat-log').innerHTML = ''; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+// ── Code ──
+function showCode(code, lang='python') {
+  currentCode = code;
+  document.getElementById('code-empty').style.display = 'none';
+  const pre = document.getElementById('code-pre');
+  const el  = document.getElementById('code-content');
+  pre.style.display = 'block';
+  el.className = `language-${lang}`;
+  el.textContent = code;
+  hljs.highlightElement(el);
+  document.getElementById('lang-badge').textContent = lang;
+}
+function copyCode() {
+  if (!currentCode) return;
+  navigator.clipboard.writeText(currentCode);
+  const btn = document.getElementById('copy-btn');
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(()=>{ btn.textContent='Copy'; btn.classList.remove('copied'); }, 2000);
+}
+
+// ── Web / Output ──
+function showOutput(content, format='text') {
+  const empty   = document.getElementById('web-empty');
+  const results = document.getElementById('web-results');
+  empty.style.display = 'none';
+  if (format === 'html') {
+    results.innerHTML = content;  // server-built HTML (escaped at source)
+  } else {
+    results.innerHTML = `<div style="font-size:13px;line-height:1.6;color:rgba(230,237,243,.7);padding:4px 0">${escapeHtml(content)}</div>`;
+  }
+}
+
+// ── UI helpers ──
+const statusDot = document.getElementById('status-dot');
+const elabel    = document.getElementById('elabel');
+const subtitle  = document.getElementById('subtitle-bar');
+const connEl    = document.getElementById('conn-status');
+
+function setEmotion(name) {
+  if (!EXPR_MAP.hasOwnProperty(name)) return;
+  S.emotion = name;
+  elabel.textContent = name;
+  safeExpr(EXPR_MAP[name]);
+}
+function setTalking(val) {
+  S.talking = val;
+  statusDot.className = val ? 'talk' : (S.emotion==='thinking'?'think':'');
+  val ? safeMotion('talk') : safeMotion('idle');
+}
+function setSub(text) { subtitle.textContent = text||'...'; }
+
+// ── WebSocket ──
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    connEl.textContent = 'connected';
+    connEl.style.color = 'rgba(255,255,255,.8)';
+  };
+  ws.onmessage = (ev) => {
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'state') {
+        if (m.emotion) setEmotion(m.emotion);
+        if (typeof m.talking !== 'undefined') setTalking(m.talking);
+        if (m.text) setSub(m.text);
+      }
+      if (m.type === 'chat') addMessage(m.role, m.content);
+      if (m.type === 'code') showCode(m.code, m.lang || 'python');
+      if (m.type === 'output') showOutput(m.content, m.format || 'text');
+    } catch(_) {}
+  };
+  ws.onclose = () => {
+    connEl.textContent = 'disconnected';
+    connEl.style.color = 'rgba(255,100,100,.6)';
+    setTalking(false);
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ── Boot ──
+loadModel();
+connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,394 @@
+"""
+skills.py — intent routing, web search, code generation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Three "skills" Siri can do beyond plain chat:
+  1. web_search   — DuckDuckGo HTML scrape (no API key)
+  2. code_gen     — local Ollama with qwen2.5-coder
+  3. chat         — fall-through to main LLM (handled by voice_chat.py)
+
+Public API:
+  route(text)             → (intent, cleaned_query)
+  dispatch(intent, query, callbacks) → spoken_summary (str)
+  cancel_active()         → kill any in-flight HTTP request
+"""
+
+import re
+import json
+import html
+import requests
+from urllib.parse import quote_plus, unquote
+from html.parser import HTMLParser
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CONFIG
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OLLAMA_URL = "http://localhost:11434"
+CODE_MODEL = "qwen2.5-coder:3b"   # bump to :7b if you want more brains
+SEARCH_N   = 6
+
+# Track active HTTP request so the VAD interrupt can cancel mid-stream
+_active_session = None
+
+def cancel_active():
+    """Called from voice_chat when user interrupts mid-action."""
+    global _active_session
+    if _active_session is not None:
+        try: _active_session.close()
+        except: pass
+        _active_session = None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  INTENT ROUTING
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Strategy: keyword scoring, not strict regex.
+# We score each intent based on trigger words present anywhere in the
+# sentence. Highest score wins. This handles polite/garbled phrasing
+# like "Siri could you please search the NBA score on web" or
+# "I want python code such that I can copy files".
+
+# Strong triggers — single word presence is usually enough
+_SEARCH_KEYWORDS = {
+    # verb triggers
+    "search": 3, "google": 4, "lookup": 3, "browse": 2,
+    # context triggers (need pairing with a verb-ish word, see logic)
+    "web": 2, "internet": 2, "online": 2,
+    # common search intents
+    "latest": 1, "news": 1, "score": 1, "weather": 1,
+}
+_SEARCH_PHRASES = [
+    "look up", "find out", "find me", "search for", "search up",
+    "on the web", "on the internet", "on google",
+    "what is the latest", "what's the latest",
+    "any news on", "any news about",
+]
+
+_CODE_KEYWORDS = {
+    "code": 3, "script": 3, "program": 2, "function": 3, "snippet": 3,
+    "python": 2, "javascript": 2, "bash": 2, "shell": 2,
+    "typescript": 2, "rust": 2, "golang": 2,
+    "implement": 2, "algorithm": 2,
+}
+_CODE_PHRASES = [
+    "write code", "write a code", "write me code", "write a script",
+    "write me a script", "write a function", "write a program",
+    "give me code", "give me a script", "show me code",
+    "generate code", "create a script", "create a function",
+    "how do i code", "how do i write", "how do i implement",
+    "python code", "python script", "javascript code", "js code",
+    "bash script", "shell script",
+]
+
+# Phrases that should HARD OVERRIDE — if present, intent is locked
+_HARD_SEARCH = ["search the web", "search on web", "search on the web",
+                "google it", "google that", "search online"]
+_HARD_CODE   = ["write code", "write a code", "write a script",
+                "write me code", "write me a script", "write the code"]
+
+# Negative signals — words that suggest pure chat even if a keyword is present
+_CHAT_OVERRIDES = ["how are you", "tell me about yourself",
+                   "what do you think", "i feel", "i love", "i hate"]
+
+
+def _score_intent(low: str, keywords: dict, phrases: list) -> int:
+    score = 0
+    # Word-boundary matches for keywords
+    for kw, weight in keywords.items():
+        if re.search(r"\b" + re.escape(kw) + r"\b", low):
+            score += weight
+    # Phrase matches
+    for ph in phrases:
+        if ph in low:
+            score += 4
+    return score
+
+
+def route(text: str) -> tuple[str, str]:
+    """
+    Returns (intent, query). intent in {'search', 'code', 'chat'}.
+    Uses keyword scoring across the whole sentence, not start-of-string regex.
+    """
+    t = text.strip()
+    low = t.lower()
+
+    # Hard overrides first — unambiguous phrases
+    for ph in _HARD_SEARCH:
+        if ph in low:
+            q = _extract_search_query(low, t)
+            return "search", q
+    for ph in _HARD_CODE:
+        if ph in low:
+            return "code", t
+
+    # Chat overrides — pure conversation, never route to skill
+    for ph in _CHAT_OVERRIDES:
+        if ph in low:
+            return "chat", t
+
+    # Score-based routing
+    search_score = _score_intent(low, _SEARCH_KEYWORDS, _SEARCH_PHRASES)
+    code_score   = _score_intent(low, _CODE_KEYWORDS,   _CODE_PHRASES)
+
+    # Need a meaningful score to override chat
+    THRESHOLD = 3
+
+    if search_score >= THRESHOLD and search_score > code_score:
+        q = _extract_search_query(low, t)
+        return "search", q
+
+    if code_score >= THRESHOLD and code_score >= search_score:
+        return "code", t
+
+    return "chat", t
+
+
+def _extract_search_query(low: str, original: str) -> str:
+    """
+    Try to pull out just the topic from a search request.
+    Falls back to the full sentence if extraction is unclear.
+    """
+    # Common patterns to strip
+    cleanups = [
+        # remove polite preambles
+        r"^(?:hey |hi |yo |siri,? )?(?:could |can |will |would )?you (?:please )?",
+        r"^(?:please |kindly )",
+        r"^(?:i want (?:you )?to |i need (?:you )?to |i'd like (?:you )?to )",
+        # remove search verb phrases
+        r"\b(?:search (?:for |up )?|google |look up |find (?:out |me )?|browse (?:for )?)\b",
+        # remove trailing context
+        r"\s+on (?:the )?(?:web|internet|google|online)\s*\??\.?\s*$",
+        r"\s+for me\s*\??\.?\s*$",
+    ]
+    q = low
+    for pat in cleanups:
+        q = re.sub(pat, " ", q)
+    q = re.sub(r"\s+", " ", q).strip(" ?.!,")
+    # If we stripped too much, fall back to original
+    if len(q) < 3:
+        return original.strip(" ?.!,")
+    return q
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  DISPATCH
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def dispatch(intent: str, query: str, callbacks: dict) -> str:
+    """
+    Run the action. Returns a SHORT (1 sentence) spoken summary
+    that voice_chat.py will pass to TTS.
+
+    callbacks = {
+        'code_send':   fn(code, lang, explanation),
+        'output_send': fn(html_string, format='html'),
+    }
+    """
+    try:
+        if intent == "search":
+            results = web_search(query, n=SEARCH_N)
+            if not results:
+                callbacks['output_send'](
+                    f"<div style='padding:14px;color:#888'>No results for "
+                    f"<b>{html.escape(query)}</b></div>", "html"
+                )
+                return f"Hmm, nothing came back for that one."
+            callbacks['output_send'](format_search_html(query, results), "html")
+            return f"Got {len(results)} results for {query}, up on your screen."
+
+        if intent == "code":
+            code, lang, explain = generate_code(query)
+            callbacks['code_send'](code, lang, explain)
+            return explain or "Done. Code is on your screen."
+
+    except Exception as e:
+        return f"That didn't work. {str(e)[:80]}"
+
+    return "Hmm, not sure what to do with that."
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  WEB SEARCH — DuckDuckGo HTML scrape
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DDG's html.duckduckgo.com endpoint returns real organic results
+# without an API key. Format: <a class="result__a" href="...">title</a>
+# followed by <a class="result__snippet">snippet</a>.
+
+class _DDGParser(HTMLParser):
+    """Tiny HTML parser that pulls out (title, url, snippet) triples."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._cur = {}
+        self._capture = None  # 'title' | 'snippet' | None
+
+    def handle_starttag(self, tag, attrs):
+        ad = dict(attrs)
+        cls = ad.get("class", "")
+        if tag == "a" and "result__a" in cls:
+            self._cur = {"url": _clean_ddg_url(ad.get("href", "")), "title": "", "snippet": ""}
+            self._capture = "title"
+        elif tag == "a" and "result__snippet" in cls:
+            self._capture = "snippet"
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capture == "snippet" and self._cur:
+            self.results.append(self._cur)
+            self._cur = {}
+            self._capture = None
+        elif tag == "a" and self._capture == "title":
+            self._capture = None  # title done, wait for snippet
+
+    def handle_data(self, data):
+        if self._capture == "title" and self._cur:
+            self._cur["title"] += data
+        elif self._capture == "snippet" and self._cur:
+            self._cur["snippet"] += data
+
+
+def _clean_ddg_url(href: str) -> str:
+    """DDG wraps real URLs in /l/?uddg=<encoded>. Unwrap it."""
+    if not href: return ""
+    m = re.search(r"uddg=([^&]+)", href)
+    if m:
+        return unquote(m.group(1))
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def web_search(query: str, n: int = 6) -> list[dict]:
+    """Returns list of {title, url, snippet} dicts."""
+    global _active_session
+    _active_session = requests.Session()
+    try:
+        r = _active_session.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        parser = _DDGParser()
+        parser.feed(r.text)
+        out = []
+        for res in parser.results[:n]:
+            title = re.sub(r"\s+", " ", res["title"]).strip()
+            snip  = re.sub(r"\s+", " ", res["snippet"]).strip()
+            url   = res["url"].strip()
+            if title and url:
+                out.append({"title": title, "url": url, "snippet": snip})
+        return out
+    finally:
+        try: _active_session.close()
+        except: pass
+        _active_session = None
+
+
+def format_search_html(query: str, results: list[dict]) -> str:
+    """HTML to inject into the dashboard's #web-results div."""
+    parts = [
+        f'<div style="padding:6px 0 12px;font-size:11px;'
+        f'color:#888;letter-spacing:.08em;text-transform:uppercase">'
+        f'Results for "{html.escape(query)}"</div>'
+    ]
+    for r in results:
+        parts.append(
+            f'<div class="web-result">'
+            f'  <a class="web-result-title" href="{html.escape(r["url"])}" '
+            f'     target="_blank" rel="noopener">{html.escape(r["title"])}</a>'
+            f'  <div class="web-result-url">{html.escape(r["url"][:80])}</div>'
+            f'  <div class="web-result-snippet">{html.escape(r["snippet"])}</div>'
+            f'</div>'
+        )
+    return "".join(parts)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CODE GENERATION — local Ollama with qwen2.5-coder
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_CODE_SYSTEM = """You are a code generator. Given a user request, respond with ONLY a JSON object:
+{"language": "<lang>", "code": "<code>", "explanation": "<one short sentence>"}
+
+Rules:
+- language: lowercase, one of: python, javascript, bash, typescript, go, rust, html, sql, java, cpp
+- code: complete, runnable, well-commented. No markdown fences inside the JSON string.
+- explanation: ONE sentence, max 15 words, casual tone. This will be spoken aloud.
+- Output ONLY the JSON object. No preamble. No markdown. No code fences around the JSON."""
+
+
+def generate_code(query: str) -> tuple[str, str, str]:
+    """Returns (code, language, spoken_explanation)."""
+    global _active_session
+    _active_session = requests.Session()
+
+    payload = {
+        "model": CODE_MODEL,
+        "messages": [
+            {"role": "system", "content": _CODE_SYSTEM},
+            {"role": "user",   "content": query},
+        ],
+        "stream": False,
+        "format": "json",         # forces valid JSON output
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 4096,
+            "num_predict": 1500,
+        },
+    }
+
+    try:
+        r = _active_session.post(
+            f"{OLLAMA_URL}/api/chat",
+            json=payload, timeout=90,
+        )
+        r.raise_for_status()
+        raw = r.json().get("message", {}).get("content", "")
+    finally:
+        try: _active_session.close()
+        except: pass
+        _active_session = None
+
+    # Parse the JSON response
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback: try to pull JSON out of mixed output
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            raise ValueError("Coder model returned non-JSON")
+        parsed = json.loads(m.group(0))
+
+    code  = parsed.get("code", "").strip()
+    lang  = parsed.get("language", "python").strip().lower()
+    expl  = parsed.get("explanation", "Code is ready.").strip()
+
+    # Strip accidental markdown fences inside the code field
+    code = re.sub(r"^```\w*\n?", "", code)
+    code = re.sub(r"\n?```$", "", code)
+
+    return code, lang, expl
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Quick self-test  →  python skills.py "search for python tutorials"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if __name__ == "__main__":
+    import sys
+    test = " ".join(sys.argv[1:]) or "search for fastapi tutorial"
+    intent, q = route(test)
+    print(f"Input    : {test}")
+    print(f"Intent   : {intent}")
+    print(f"Query    : {q}")
+    if intent == "search":
+        results = web_search(q, n=3)
+        for i, res in enumerate(results, 1):
+            print(f"\n[{i}] {res['title']}\n    {res['url']}\n    {res['snippet'][:100]}...")
+    elif intent == "code":
+        code, lang, expl = generate_code(q)
+        print(f"\nLang     : {lang}\nExplain  : {expl}\n--- CODE ---\n{code}")

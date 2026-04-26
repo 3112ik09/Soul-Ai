@@ -183,6 +183,16 @@ async function loadModel() {
 
     console.log(`✅ Model loaded — size: ${m.width}x${m.height}, scale: ${scale.toFixed(2)}, modelH: ${modelH.toFixed(0)}px`);
 
+    // Debug — list available expressions
+    setTimeout(() => {
+      const expMgr = m.internalModel.motionManager.expressionManager;
+      if (expMgr) {
+        console.log('✅ Expressions loaded:', Object.keys(expMgr.definitions || {}));
+      } else {
+        console.warn('❌ No expression manager found — model3.json may be missing Expressions');
+      }
+    }, 1000);
+
   } catch(err) {
     console.error('Load error:', err);
     document.getElementById('load-msg').textContent = '❌ Failed — check console';
@@ -230,7 +240,12 @@ function tick(dt) {
 function safeParam(core, id, val) { try { core.setParameterValueById(id, val); } catch(_) {} }
 function safeExpr(name) {
   if (!model) return;
-  try { name ? model.expression(name) : model.expression(); } catch(_) {}
+  try {
+    console.log('Setting expression:', name || 'reset');
+    name ? model.expression(name) : model.expression();
+  } catch(e) {
+    console.warn('Expression failed:', name, e.message);
+  }
 }
 function safeMotion(g) { if (!model) return; try { model.motion(g); } catch(_) {} }
 function bar(p) { document.getElementById('bar').style.width = p+'%'; }
