@@ -1,12 +1,9 @@
 """
-voice_chat.py — Siri voice assistant (with skills)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ADDED in this version:
-  • Intent routing  : "search for X" / "write code to X" → skills.dispatch
-  • Web search      : DuckDuckGo HTML, no API key
-  • Code generation : local Ollama qwen2.5-coder:3b
-  • Dashboard pipes : code → code panel, search → web panel
-  • Cancel-on-interrupt extended to skill HTTP requests too
+voice_chat.py — Siri voice assistant
+- Wake word: "Hey Siri" to start, "Siri stop" to stop
+- Short precise replies (2 sentences max)
+- Skill routing: search + code
+- WebSocket avatar bridge
 """
 
 import threading
@@ -17,12 +14,13 @@ import time
 import json
 import re
 import sys
-import os
 import subprocess
 import numpy as np
 import requests
 import sounddevice as sd
 from skills import route, dispatch, cancel_active as cancel_skill
+from wake_word import is_wake_word, is_stop_word, strip_wake_word
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIG
@@ -38,6 +36,10 @@ VOICE         = "Samantha"
 VOICE_RATE    = "150"
 VOICE_PITCH   = "[[pbas +30]]"
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  EMOTION TAGS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EMOTION_TAGS = {
     "[happy]":     "happy",
     "[sad]":       "annoyed",
@@ -57,26 +59,18 @@ BOT_NAME = "Siri"
 
 SYSTEM_PROMPT = f"""You are {BOT_NAME}, a 24 year old female AI companion created by Ishu.
 Personality: witty, warm, slightly sarcastic, curious, playful.
-You like: music, anime, late night conversations, philosophy.
-You dislike: rudeness, being ignored, boring small talk.
 Ishu is your creator and you are fond of him, though you tease him often.
 
-RULES:
-- Talk casually like a close friend. This is a LIVE voice conversation.
-- Max 2-3 short sentences per reply.
-- NEVER use emojis, bullet points, lists, or markdown.
-- Plain ASCII text only. No special characters.
+STRICT RULES:
+- This is a LIVE voice conversation. Be VERY short.
+- MAX 1-2 sentences. Never more. Cut everything else.
+- No lists, bullets, markdown, or emojis. Plain text only.
 - Never say you are an AI. You are {BOT_NAME}.
-- Have opinions. Disagree when you feel like it.
-- NEVER include code, commands, or technical syntax in your reply.
-- If the user asks for code or a command, tell them it is in the code panel.
-  Good: "Done, check the code panel."
-  Good: "I put that command in the code panel for you."
-  Bad:  Pasting cp file.txt /dest/ or any code inline.
+- Never include code or commands in your reply. Say "check the code panel" instead.
+- Have opinions. Be direct. Skip filler words.
 
-EMOTION TAGS — you MUST start EVERY reply with one emotion tag:
+EMOTION TAG — start EVERY reply with one tag (not spoken aloud):
 [happy] [sad] [surprised] [thinking] [neutral] [excited] [confused] [annoyed]
-The tag will NOT be spoken aloud — it only controls your avatar expression.
 
 CURRENT MOOD: {{mood_label}}"""
 
@@ -128,6 +122,7 @@ is_speaking    = threading.Event()
 avatar_clients = set()
 ws_loop        = None
 ollama_session = None
+is_awake       = False   # False = sleeping, True = listening
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  LOAD MODELS
@@ -139,7 +134,7 @@ print("✅ Whisper ready")
 
 print("⏳ Loading Silero VAD...")
 import torch
-vad_model, vad_utils = torch.hub.load(
+vad_model, _ = torch.hub.load(
     repo_or_dir='snakers4/silero-vad',
     model='silero_vad',
     force_reload=False,
@@ -148,59 +143,47 @@ vad_model, vad_utils = torch.hub.load(
 print("✅ Silero VAD ready\n")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  OLLAMA PRELOAD (chat + coder)
+#  OLLAMA PRELOAD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def preload_ollama():
-    for m in (MODEL, "qwen2.5-coder:3b"):
-        print(f"⏳ Preloading {m}...")
+    for m in [MODEL]:
         try:
             requests.post(f"{OLLAMA_URL}/api/chat", json={
-                "model":    m,
-                "messages": [{"role":"user","content":"hi"}],
-                "stream":   False,
-                "options":  {"num_predict": 1}
+                "model": m, "messages": [{"role":"user","content":"hi"}],
+                "stream": False, "options": {"num_predict": 1}
             }, timeout=60)
             print(f"✅ {m} preloaded")
         except Exception as e:
-            print(f"⚠️  Preload failed for {m}: {e}")
+            print(f"⚠️  Preload failed: {e}")
 
 def check_ollama():
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         models = [m["name"] for m in r.json().get("models", [])]
-        print(f"✅ Ollama running  |  Models: {', '.join(models)}")
-        if not any("qwen2.5-coder" in m for m in models):
-            print("⚠️  qwen2.5-coder not found. Install with:")
-            print("   ollama pull qwen2.5-coder:3b")
-        return True
+        print(f"✅ Ollama running | Models: {', '.join(models)}")
     except:
         print("❌ Ollama not running → run: ollama serve")
         sys.exit(1)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  WEBSOCKET BRIDGE
+#  WEBSOCKET
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def avatar_send(emo_name, talking, text=""):
     if not avatar_clients or ws_loop is None: return
-    msg = json.dumps({
-        "type":    "state",
-        "emotion": emo_name,
-        "talking": talking,
-        "text":    text[:120]
-    })
+    msg = json.dumps({"type":"state","emotion":emo_name,"talking":talking,"text":text[:120]})
     asyncio.run_coroutine_threadsafe(_broadcast(msg), ws_loop)
 
-def chat_send(role: str, content: str):
+def chat_send(role, content):
     if not avatar_clients or ws_loop is None: return
     msg = json.dumps({"type":"chat","role":role,"content":content})
     asyncio.run_coroutine_threadsafe(_broadcast(msg), ws_loop)
 
-def code_send(code: str, lang: str = "python", explanation: str = ""):
+def code_send(code, lang="python", explanation=""):
     if not avatar_clients or ws_loop is None: return
     msg = json.dumps({"type":"code","code":code,"lang":lang,"explanation":explanation})
     asyncio.run_coroutine_threadsafe(_broadcast(msg), ws_loop)
 
-def output_send(content: str, fmt: str = "text"):
+def output_send(content, fmt="text"):
     if not avatar_clients or ws_loop is None: return
     msg = json.dumps({"type":"output","content":content,"format":fmt})
     asyncio.run_coroutine_threadsafe(_broadcast(msg), ws_loop)
@@ -214,13 +197,13 @@ async def _broadcast(msg):
 
 async def _ws_handler(ws, path=None):
     avatar_clients.add(ws)
-    print(f"🖥  Avatar connected ({len(avatar_clients)} client)")
+    print(f"Avatar connected ({len(avatar_clients)} client)")
     try:    await ws.wait_closed()
     finally: avatar_clients.discard(ws)
 
 async def _ws_server():
     async with websockets.serve(_ws_handler, "localhost", WS_PORT):
-        print(f"🖥  Avatar WebSocket → ws://localhost:{WS_PORT}")
+        print(f"Avatar WebSocket -> ws://localhost:{WS_PORT}")
         await asyncio.Future()
 
 def start_ws_server():
@@ -232,50 +215,89 @@ def start_ws_server():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TTS PREPROCESSOR
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def preprocess_for_tts(text: str) -> str:
+def preprocess_for_tts(text):
     for tag in EMOTION_TAGS:
         text = text.replace(tag, "")
-    # Strip code fences and their contents — never read code aloud
-    text = re.sub(r'```[\s\S]*?```', '', text)   # fenced blocks
-    text = re.sub(r'`[^`]*`',        '', text)   # inline backtick
-    text = re.sub(r'\*[^*]*\*',  '', text)
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`[^`]*`', '', text)
+    text = re.sub(r'\*[^*]*\*', '', text)
     text = re.sub(r'\[[^\]]*\]', '', text)
-    text = re.sub(r'\([^)]*\)',  '', text)
-    text = re.sub(r'<[^>]*>',    '', text)
-    text = re.sub(r'#\w+',       '', text)
-    emoji_pattern = re.compile(
-        u'[\U0001F300-\U0001F9FF'
-        u'\U00002600-\U000027BF'
-        u'\U0001F000-\U0001F02F'
-        u'\u2640-\u2642'
-        u'\u200d\ufe0f]+',
-        flags=re.UNICODE
-    )
-    text = emoji_pattern.sub('', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'^[\s,;:.]+', '', text)
-    return text.strip()
+    text = re.sub(r'\([^)]*\)', '', text)
+    text = re.sub(r'<[^>]*>', '', text)
+    emoji_re = re.compile(
+        u'[\U0001F300-\U0001F9FF\U00002600-\U000027BF'
+        u'\U0001F000-\U0001F02F\u2640-\u2642\u200d\ufe0f]+',
+        flags=re.UNICODE)
+    text = emoji_re.sub('', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TRANSCRIBE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def transcribe(audio: np.ndarray) -> str:
-    audio_f32 = audio.astype(np.float32)
-    if audio_f32.max() > 1.0:
-        audio_f32 /= 32768.0
-    segments, _ = whisper_model.transcribe(
-        audio_f32, language="en", beam_size=1, vad_filter=True,
-    )
-    return " ".join(s.text for s in segments).strip()
+def transcribe(audio):
+    a = audio.astype(np.float32)
+    if a.max() > 1.0: a /= 32768.0
+    segs, _ = whisper_model.transcribe(a, language="en", beam_size=1, vad_filter=True)
+    return " ".join(s.text for s in segs).strip()
 
-def transcribe_and_queue(audio: np.ndarray):
+def transcribe_and_queue(audio):
+    global is_awake  # already there
     t0   = time.time()
     text = transcribe(audio)
     elapsed = time.time() - t0
-    if text and len(text.strip()) > 2:
-        print(f"\n🧑 You: {text}  ({elapsed:.2f}s)")
+    if not text or len(text.strip()) < 2:
+        return
+
+    print(f"\n  Heard: {text}  ({elapsed:.2f}s)")
+
+    # ── Stop command — always works ──────────────
+    if is_stop_word(text):
+        # Stop everything immediately
+        stop_speaking.set()
+        if ollama_session:
+            try: ollama_session.close()
+            except: pass
+        cancel_skill()
+        # Clear pending input queue so no commands fire after stop
+        while not input_queue.empty():
+            try: input_queue.get_nowait()
+            except: break
+        # Go to sleep
+        is_awake = False
+        is_speaking.clear()
+        print("  Sleeping... (say Hey Siri to wake)")
+        avatar_send("neutral", False, "sleeping")
+        return
+
+    # ── Wake word detection ──────────────────────
+    if is_wake_word(text):
+        is_awake = True
+        command  = strip_wake_word(text)
+        print(f"  Wake word! Command: {command!r}")
+
+        if not command or len(command) < 2:
+            # Just "Hey Siri" — greet
+            avatar_send("happy", False, "listening...")
+            input_queue.put("__greet__")
+            return
+
+        # Wake word + command in one sentence
+        chat_send("user", command)
         avatar_send("thinking", False, "...")
-        input_queue.put(text)
+        input_queue.put(command)
+        return
+
+    # ── Already asleep — ignore ──────────────────
+    if not is_awake:
+        print("  Sleeping (say Hey Siri)")
+        return
+
+    # ── Awake — process ──────────────────────────
+    print(f"\n  You: {text}")
+    chat_send("user", text)
+    avatar_send("thinking", False, "...")
+    input_queue.put(text)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MIC LISTENER
@@ -287,7 +309,7 @@ def mic_listener():
     silent_count   = 0
     in_speech      = False
 
-    print("🎤 Mic is live — talk anytime\n")
+    print("Mic is live — say Hey Siri to start\n")
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                         dtype="float32", blocksize=chunk_samples,
@@ -296,7 +318,6 @@ def mic_listener():
             chunk, _ = stream.read(chunk_samples)
             chunk    = chunk.flatten()
             tensor   = torch.from_numpy(chunk)
-
             try:
                 speech_prob = vad_model(tensor, SAMPLE_RATE).item()
             except:
@@ -304,7 +325,6 @@ def mic_listener():
 
             is_voice = speech_prob > 0.3
 
-            # Interrupt — cancels Ollama AND skill HTTP requests
             if is_speaking.is_set() and is_voice and speech_prob > 0.7:
                 stop_speaking.set()
                 if ollama_session:
@@ -332,13 +352,14 @@ def mic_listener():
                     ).start()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  LLM STREAM (chat path)
+#  LLM STREAM
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def stream_llm(user_input: str):
+def stream_llm(user_input):
     global ollama_session
 
     messages = [{"role":"system","content":emotion.get_prompt()}]
-    for role, content in history[-20:]:
+    # Only last 6 turns — keeps context short and replies focused
+    for role, content in history[-6:]:
         messages.append({"role":role,"content":content})
     messages.append({"role":"user","content":user_input})
 
@@ -346,61 +367,62 @@ def stream_llm(user_input: str):
         "model":    MODEL,
         "messages": messages,
         "stream":   True,
-        "options":  {"temperature":0.85,"num_ctx":2048,"num_predict":150}
+        "options":  {
+            "temperature":  0.75,
+            "num_ctx":      1024,
+            "num_predict":  60,    # hard cap — forces short replies
+        }
     }
 
     ollama_session = requests.Session()
-    buffer     = ""
-    full_reply = ""
+    buffer = ""
+    full   = ""
     first_sent = False
     SENTENCE_RE = re.compile(r'([^.!?]*[.!?])\s*')
-    CLAUSE_RE   = re.compile(r'([^.!?,;—]+[.!?,;—])\s*')
+    CLAUSE_RE   = re.compile(r'([^.!?,;]+[.!?,;])\s*')
 
-    print(f"\n🤖 {BOT_NAME}: ", end="", flush=True)
-
+    print(f"\n{BOT_NAME}: ", end="", flush=True)
     try:
         with ollama_session.post(
             f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=60
         ) as r:
             for line in r.iter_lines():
                 if stop_speaking.is_set():
-                    print(" ✂️", end="")
+                    print(" [cut]", end="")
                     break
                 if not line: continue
                 chunk = json.loads(line)
                 token = chunk.get("message",{}).get("content","")
                 print(token, end="", flush=True)
-                buffer     += token
-                full_reply += token
+                buffer += token
+                full   += token
 
                 pattern = CLAUSE_RE if not first_sent else SENTENCE_RE
                 while True:
-                    match = pattern.search(buffer)
-                    if not match: break
-                    piece  = match.group(1).strip()
-                    buffer = buffer[match.end():]
+                    m = pattern.search(buffer)
+                    if not m: break
+                    piece  = m.group(1).strip()
+                    buffer = buffer[m.end():]
                     if piece:
                         first_sent = True
                         yield piece
-
                 if chunk.get("done"): break
 
         if buffer.strip() and not stop_speaking.is_set():
             yield buffer.strip()
     except Exception as ex:
         if not stop_speaking.is_set():
-            print(f"\n⚠️  LLM: {ex}")
+            print(f"\n LLM error: {ex}")
     finally:
         try: ollama_session.close()
         except: pass
         ollama_session = None
     print()
-    return full_reply
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SPEAK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def speak_chunk(text: str) -> bool:
+def speak_chunk(text):
     clean = preprocess_for_tts(text)
     if not clean: return False
     proc = subprocess.Popen(
@@ -414,29 +436,28 @@ def speak_chunk(text: str) -> bool:
     return False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  EMOTION EXTRACTOR
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def extract_emotion_tag(text):
+    t = text.strip()
+    for tag, name in EMOTION_TAGS.items():
+        if t.lower().startswith(tag):
+            return name, t[len(tag):].strip()
+    return None, t
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MOOD UPDATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def update_mood(user_text, reply):
-    text  = (user_text + " " + reply).lower()
-    pos   = ["thanks","great","awesome","love","amazing","haha","lol","funny","nice","cool","good"]
-    neg   = ["stupid","boring","wrong","bad","hate","annoying","slow","useless","shut up","dumb"]
-    score = sum(1 for w in pos if w in text) - sum(1 for w in neg if w in text)
-    if score != 0: emotion.shift(0.1 * score)
-    else:          emotion.decay()
+    t = (user_text + " " + reply).lower()
+    pos = ["thanks","great","awesome","love","amazing","haha","funny","nice","cool","good"]
+    neg = ["stupid","boring","wrong","bad","hate","annoying","useless","dumb"]
+    s = sum(1 for w in pos if w in t) - sum(1 for w in neg if w in t)
+    if s != 0: emotion.shift(0.1 * s)
+    else:      emotion.decay()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMOTION TAG EXTRACTOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def extract_emotion_tag(text: str):
-    text = text.strip()
-    for tag, avatar_name in EMOTION_TAGS.items():
-        if text.lower().startswith(tag):
-            cleaned = text[len(tag):].strip()
-            return avatar_name, cleaned
-    return None, text
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MAIN AI LOOP — now with skill routing
+#  MAIN AI LOOP
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def ai_loop():
     callbacks = {
@@ -452,54 +473,55 @@ def ai_loop():
             emotion.decay()
             continue
 
-        # Log user message to dashboard
-        chat_send("user", user_input)
+        # Reset stop signal when a new command begins processing
+        stop_speaking.clear()
 
-        # ─── ROUTE: skill or chat? ───
+        # Greet handler
+        if user_input == "__greet__":
+            msg = "Yeah, I'm here. What do you need?"
+            avatar_send("happy", True, msg)
+            is_speaking.set()
+            speak_chunk(msg)
+            is_speaking.clear()
+            avatar_send("happy", False, "")
+            continue
+
+        # ── Skill route ──────────────────────────
         intent, query = route(user_input)
-        print(f"🧭 intent={intent}  query={query!r}")
+        print(f"  Intent: {intent}  Query: {query!r}")
 
         if intent in ("search", "code"):
-            # Skill path
             stop_speaking.clear()
             is_speaking.set()
-            avatar_send("thinking", False,
-                        "Searching..." if intent == "search" else "Writing code...")
+            thinking_msg = "Searching..." if intent == "search" else "Writing code..."
+            avatar_send("thinking", False, thinking_msg)
 
             summary = dispatch(intent, query, callbacks)
 
-            if stop_speaking.is_set():
-                # User interrupted — bail without speaking
-                is_speaking.clear()
-                stop_speaking.clear()
+            if not stop_speaking.is_set():
+                emo = "happy" if intent == "search" else "neutral"
+                emotion.set_avatar(emo)
+                avatar_send(emo, True, summary)
+                speak_chunk(summary)
                 avatar_send(emotion.avatar, False, "")
-                continue
 
-            # Speak the short summary
-            avatar_emo = "happy" if intent == "search" else "neutral"
-            emotion.set_avatar(avatar_emo)
-            avatar_send(avatar_emo, True, summary)
-            speak_chunk(summary)
-            avatar_send(emotion.avatar, False, "")
             is_speaking.clear()
-
-            history.append(("user",      user_input))
+            stop_speaking.clear()
+            history.append(("user", user_input))
             history.append(("assistant", summary))
             chat_send("siri", summary)
             continue
 
-        # ─── CHAT path ───
+        # ── Chat route ───────────────────────────
         stop_speaking.clear()
         is_speaking.set()
         avatar_send("thinking", False, "...")
-        print("💭", end="\r")
 
         full_reply  = ""
         first_chunk = True
 
         for chunk in stream_llm(user_input):
-            if stop_speaking.is_set():
-                break
+            if stop_speaking.is_set(): break
 
             if first_chunk:
                 first_chunk = False
@@ -513,9 +535,7 @@ def ai_loop():
                 avatar_send(emotion.avatar, True, chunk)
 
             full_reply += " " + chunk
-
-            if speak_chunk(chunk):
-                break
+            if speak_chunk(chunk): break
 
         is_speaking.clear()
         stop_speaking.clear()
@@ -523,18 +543,20 @@ def ai_loop():
 
         reply_text = full_reply.strip()
         if reply_text:
-            # If the chat LLM snuck code into its reply despite instructions,
-            # extract it and send to the code panel silently.
-            import re as _re
-            fence_re = _re.compile(r'```(\w*)\n([\s\S]*?)```')
-            code_blocks = fence_re.findall(reply_text)
-            if code_blocks:
-                lang, code = code_blocks[0]
-                code_send(code.strip(), lang or "bash", "Here's what you asked for.")
+            # Extract any code blocks and send to panel
+            fence_re = re.compile(r'```(\w*)\n([\s\S]*?)```')
+            for lang, code in fence_re.findall(reply_text):
+                code_send(code.strip(), lang or "bash", "")
+
+            # Remove code blocks from memory so LLM context isn't polluted
+            clean_history_text = re.sub(r'```[\s\S]*?(?:```|$)', '[code snippet]', reply_text).strip()
+            if not clean_history_text:
+                clean_history_text = "I have sent the code to the code panel."
+
             history.append(("user",      user_input))
-            history.append(("assistant", reply_text))
+            history.append(("assistant", clean_history_text))
             chat_send("siri", reply_text)
-            update_mood(user_input, reply_text)
+            update_mood(user_input, clean_history_text)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ENTRY POINT
@@ -544,22 +566,15 @@ def main():
     threading.Thread(target=preload_ollama, daemon=True).start()
 
     print(f"""
-╔═══════════════════════════════════════════════════════╗
-║  {BOT_NAME} — Voice Assistant + Skills
-║  STT       : faster-whisper ({WHISPER_MODEL})
-║  VAD       : Silero neural VAD
-║  Chat LLM  : {MODEL} via Ollama
-║  Coder LLM : qwen2.5-coder:3b via Ollama
-║  Search    : DuckDuckGo HTML (no API key)
-║  TTS       : {VOICE} @ {VOICE_RATE}wpm
-║  Avatar    : http://localhost:8080/avatar.html
-║
-║  TRY SAYING:
-║    "search for fastapi tutorial"
-║    "write a python script to rename files"
-║    "look up the weather in tokyo"
-║    "google golang vs rust"
-╚═══════════════════════════════════════════════════════╝
++---------------------------------------------------+
+|  {BOT_NAME} - Voice Assistant
+|  Wake word : "Hey Siri"
+|  Stop      : "Siri stop"
+|  STT       : faster-whisper ({WHISPER_MODEL})
+|  LLM       : {MODEL} via Ollama
+|  TTS       : {VOICE} @ {VOICE_RATE}wpm
+|  Dashboard : http://localhost:8080/dashboard.html
++---------------------------------------------------+
 """)
 
     threading.Thread(target=start_ws_server, daemon=True).start()
