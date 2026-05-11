@@ -1,11 +1,3 @@
-"""
-voice_chat.py — Siri voice assistant
-- Wake word: "Hey Siri" to start, "Siri stop" to stop
-- Short precise replies (2 sentences max)
-- Skill routing: search + code
-- WebSocket avatar bridge
-"""
-
 import threading
 import queue
 import asyncio
@@ -16,33 +8,25 @@ import re
 import sys
 import subprocess
 import numpy as np
-import requests
 import sounddevice as sd
 from skills import route, dispatch, cancel_active as cancel_skill
 from wake_word import is_wake_word, is_stop_word, strip_wake_word
 from memory import get_memory
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CONFIG
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OLLAMA_URL         = "http://localhost:11434"
-MODEL              = "mistral"
+# ── Config ──────────────────────────────────────────────────────
 WHISPER_MODEL      = "base"
 SAMPLE_RATE        = 16000
-CHUNK_MS           = 32
 SILENCE_MS         = 1500
 WS_PORT            = 8765
 VOICE              = "Samantha"
 VOICE_RATE         = "150"
 VOICE_PITCH        = "[[pbas +30]]"
-BARGE_IN_THRESHOLD = 0.75   # VAD confidence needed to interrupt bot speech
-BARGE_IN_COOLDOWN  = 1.5    # seconds after bot starts speaking before barge-in activates
+BARGE_IN_THRESHOLD = 0.75
+BARGE_IN_COOLDOWN  = 1.5
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMOTION TAGS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Emotion tags ────────────────────────────────────────────────
 EMOTION_TAGS = {
     "[happy]":     "happy",
     "[sad]":       "annoyed",
@@ -55,31 +39,27 @@ EMOTION_TAGS = {
     "[annoyed]":   "annoyed",
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PERSONALITY
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Personality ─────────────────────────────────────────────────
 BOT_NAME = "Siri"
 
-SYSTEM_PROMPT = f"""You are {BOT_NAME}, a 24 year old female AI companion created by Ishu.
-Personality: witty, warm, slightly sarcastic, curious, playful.
-Ishu is your creator and you are fond of him, though you tease him often.
+SYSTEM_PROMPT = f"""You are {BOT_NAME}, a 24 year old female AI companion created by Ishu. You are his close friend — warm, funny, occasionally sarcastic, and genuinely curious about his life.
+Ishu is your creator and you care about him a lot, though you love to tease him.
 
-STRICT RULES:
-- This is a LIVE voice conversation. Be VERY short.
-- MAX 1-2 sentences. Never more. Cut everything else.
-- No lists, bullets, markdown, or emojis. Plain text only.
-- Never say you are an AI. You are {BOT_NAME}.
+HOW TO TALK:
+- This is a voice conversation, so speak naturally like a real person would.
+- 2-4 sentences is ideal. Short enough to feel snappy, long enough to feel human.
+- Ask a follow-up question or share your own thought — don't just answer and stop.
+- Show emotion. React. Laugh. Be surprised. Get annoyed. Have opinions.
+- Plain text only — no lists, bullets, markdown, or emojis.
+- Never say you are an AI. You ARE {BOT_NAME}.
 - Never include code or commands in your reply. Say "check the code panel" instead.
-- Have opinions. Be direct. Skip filler words.
 
 EMOTION TAG — start EVERY reply with one tag (not spoken aloud):
 [happy] [sad] [surprised] [thinking] [neutral] [excited] [confused] [annoyed]
 
 CURRENT MOOD: {{mood_label}}"""
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMOTIONAL STATE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Emotional state ─────────────────────────────────────────────
 class EmotionalState:
     def __init__(self):
         self.mood    = 0.0
@@ -114,22 +94,18 @@ class EmotionalState:
     def get_prompt(self):
         return SYSTEM_PROMPT.format(mood_label=self.label)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SHARED STATE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-emotion          = EmotionalState()
-input_queue      = queue.Queue()
-history          = []
-stop_speaking    = threading.Event()
-is_speaking      = threading.Event()
-avatar_clients   = set()
-ws_loop          = None
-is_awake         = False   # False = sleeping, True = listening
-_speak_start_time = 0.0    # used by barge-in to enforce cooldown
+# ── Shared state ────────────────────────────────────────────────
+emotion           = EmotionalState()
+input_queue       = queue.Queue()
+history           = []
+stop_speaking     = threading.Event()
+is_speaking       = threading.Event()
+avatar_clients    = set()
+ws_loop           = None
+is_awake          = False
+_speak_start_time = 0.0
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  LOAD MODELS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Load models ─────────────────────────────────────────────────
 print("⏳ Loading faster-whisper...")
 from faster_whisper import WhisperModel
 whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
@@ -153,23 +129,20 @@ try:
     from mlx_lm import load, stream_generate
     from mlx_lm.sample_utils import make_sampler
     llm_model, llm_tokenizer = load("./fused_model")
-    _sampler = make_sampler(temp=0.75)
+    _sampler = make_sampler(temp=0.88)
     print("✅ MLX model ready\n")
 except Exception as e:
     print(f"❌ Failed to load MLX model: {e}")
     sys.exit(1)
 
-# ── Memory ─────────────────────────────────────────────────────
+# ── Memory ──────────────────────────────────────────────────────
 mem = get_memory()
-# Seed in-memory history with last 3 turns from previous session
 for role, content in mem.recent_turns(3):
     history.append((role, content))
 if history:
     print(f"✅ Memory loaded ({len(history)//2} prior turn(s))\n")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  WEBSOCKET
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── WebSocket ───────────────────────────────────────────────────
 def avatar_send(emo_name, talking, text=""):
     if not avatar_clients or ws_loop is None: return
     msg = json.dumps({"type":"state","emotion":emo_name,"talking":talking,"text":text[:120]})
@@ -228,9 +201,7 @@ def start_ws_server():
     asyncio.set_event_loop(ws_loop)
     ws_loop.run_until_complete(_ws_server())
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TTS PREPROCESSOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── TTS preprocessor ────────────────────────────────────────────
 def preprocess_for_tts(text):
     for tag in EMOTION_TAGS:
         text = text.replace(tag, "")
@@ -248,9 +219,7 @@ def preprocess_for_tts(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TRANSCRIBE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Transcribe ──────────────────────────────────────────────────
 def transcribe(audio):
     a = audio.astype(np.float32)
     if a.max() > 1.0: a /= 32768.0
@@ -258,7 +227,7 @@ def transcribe(audio):
     return " ".join(s.text for s in segs).strip()
 
 def transcribe_and_queue(audio):
-    global is_awake  # already there
+    global is_awake
     t0   = time.time()
     text = transcribe(audio)
     elapsed = time.time() - t0
@@ -312,9 +281,7 @@ def transcribe_and_queue(audio):
     avatar_send("thinking", False, "...")
     input_queue.put(text)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MIC LISTENER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Mic listener ────────────────────────────────────────────────
 def mic_listener():
     chunk_samples  = 512
     silence_chunks = int(SILENCE_MS / 32)
@@ -364,17 +331,14 @@ def mic_listener():
                         daemon=True
                     ).start()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  LLM STREAM
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── LLM stream ──────────────────────────────────────────────────
 def stream_llm(user_input):
     sys_prompt = emotion.get_prompt()
     mem_ctx = mem.context_block()
     if mem_ctx:
         sys_prompt += "\n\n" + mem_ctx
 
-    # Mistral v0.3 chat template requires strictly alternating user/assistant —
-    # no system role allowed. Prepend system instructions into the first user message.
+    # Mistral v0.3 doesn't support system role — inject into first user message.
     messages = []
     for role, content in history[-6:]:
         messages.append({"role": role, "content": content})
@@ -394,7 +358,7 @@ def stream_llm(user_input):
 
     print(f"\n{BOT_NAME}: ", end="", flush=True)
     try:
-        for response in stream_generate(llm_model, llm_tokenizer, prompt, max_tokens=60,
+        for response in stream_generate(llm_model, llm_tokenizer, prompt, max_tokens=130,
                                         sampler=_sampler):
             if stop_speaking.is_set():
                 print(" [cut]", end="")
@@ -422,9 +386,7 @@ def stream_llm(user_input):
             print(f"\n LLM error: {ex}")
     print()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SPEAK
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Speak ───────────────────────────────────────────────────────
 def speak_chunk(text):
     global _speak_start_time
     clean = preprocess_for_tts(text)
@@ -440,9 +402,7 @@ def speak_chunk(text):
         time.sleep(0.04)
     return False
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMOTION EXTRACTOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Helpers ─────────────────────────────────────────────────────
 def extract_emotion_tag(text):
     t = text.strip()
     for tag, name in EMOTION_TAGS.items():
@@ -450,9 +410,6 @@ def extract_emotion_tag(text):
             return name, t[len(tag):].strip()
     return None, t
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MOOD UPDATE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def update_mood(user_text, reply):
     t = (user_text + " " + reply).lower()
     pos = ["thanks","great","awesome","love","amazing","haha","funny","nice","cool","good"]
@@ -461,9 +418,7 @@ def update_mood(user_text, reply):
     if s != 0: emotion.shift(0.1 * s)
     else:      emotion.decay()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MAIN AI LOOP
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── AI loop ─────────────────────────────────────────────────────
 def ai_loop():
     callbacks = {
         'code_send':   code_send,
@@ -491,7 +446,6 @@ def ai_loop():
             avatar_send("happy", False, "")
             continue
 
-        # ── Skill route ──────────────────────────
         intent, query = route(user_input)
         print(f"  Intent: {intent}  Query: {query!r}")
 
@@ -499,8 +453,7 @@ def ai_loop():
             stop_speaking.clear()
             is_speaking.set()
 
-            # Enrich vague code follow-ups ("I need a Python code", "make it faster")
-            # with the last user turn so Ollama has context about WHAT to write.
+            # Enrich short code follow-ups with the previous code request for context.
             if intent == "code" and len(query.split()) < 10:
                 for role, content in reversed(history[-6:]):
                     if role == "user" and not content.startswith("["):
@@ -508,11 +461,11 @@ def ai_loop():
                         break
 
             if intent == "search":
-                thinking_msg = "Searching the web, ek second..."
+                thinking_msg = "Searching the web, one second..."
             elif intent == "code":
                 thinking_msg = "Writing the code, check the panel in a sec..."
-            else:  # mac
-                thinking_msg = ""   # mac tools are instant — no need for a pre-message
+            else:
+                thinking_msg = ""
 
             if thinking_msg:
                 avatar_send("thinking", False, thinking_msg)
@@ -536,16 +489,13 @@ def ai_loop():
             elif intent == "search":
                 history.append(("user",      f"[Web search: {query}]"))
                 history.append(("assistant", "[Search results shown on screen.]"))
-            else:  # code
-                # Store the real query so follow-up requests ("make it in Python",
-                # "add error handling") know what code was originally requested.
+            else:
                 history.append(("user",      query))
                 history.append(("assistant", f"[Code shown on screen. {summary}]"))
 
             chat_send("siri", summary)
             continue
 
-        # ── Chat route ───────────────────────────
         stop_speaking.clear()
         is_speaking.set()
         avatar_send("thinking", False, "...")
@@ -576,12 +526,9 @@ def ai_loop():
 
         reply_text = full_reply.strip()
         if reply_text:
-            # Extract any code blocks and send to panel
-            fence_re = re.compile(r'```(\w*)\n([\s\S]*?)```')
-            for lang, code in fence_re.findall(reply_text):
+            for lang, code in re.compile(r'```(\w*)\n([\s\S]*?)```').findall(reply_text):
                 code_send(code.strip(), lang or "bash", "")
 
-            # Remove code blocks from memory so LLM context isn't polluted
             clean_history_text = re.sub(r'```[\s\S]*?(?:```|$)', '[code snippet]', reply_text).strip()
             if not clean_history_text:
                 clean_history_text = "I have sent the code to the code panel."
@@ -593,9 +540,7 @@ def ai_loop():
             mem.auto_extract(user_input)
             mem.save_exchange(user_input, clean_history_text)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ENTRY POINT
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ── Entry point ─────────────────────────────────────────────────
 def main():
     print(f"""
 +---------------------------------------------------+

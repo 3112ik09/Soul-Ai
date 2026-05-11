@@ -1,33 +1,13 @@
-"""
-skills.py — intent routing, web search, code generation
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Three "skills" Siri can do beyond plain chat:
-  1. web_search   — DuckDuckGo HTML scrape (no API key)
-  2. code_gen     — local Ollama with qwen2.5-coder
-  3. chat         — fall-through to main LLM (handled by voice_chat.py)
-
-Public API:
-  route(text)             → (intent, cleaned_query)
-  dispatch(intent, query, callbacks) → spoken_summary (str)
-  cancel_active()         → kill any in-flight HTTP request
-"""
-
 import re
 import json
 import html
 import requests
-from urllib.parse import quote_plus, unquote
+from urllib.parse import unquote
 from html.parser import HTMLParser
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CONFIG
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OLLAMA_URL = "http://localhost:11434"
-CODE_MODEL = "qwen2.5-coder:3b"   # bump to :7b if you want more brains
-SEARCH_N   = 6
-
-# Track active HTTP request so the VAD interrupt can cancel mid-stream
+OLLAMA_URL      = "http://localhost:11434"
+CODE_MODEL      = "qwen2.5-coder:3b"
+SEARCH_N        = 6
 _active_session = None
 
 def cancel_active():
@@ -39,9 +19,6 @@ def cancel_active():
         _active_session = None
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  INTENT ROUTING
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Strategy: keyword scoring, not strict regex.
 # We score each intent based on trigger words present anywhere in the
 # sentence. Highest score wins. This handles polite/garbled phrasing
@@ -223,9 +200,6 @@ def _extract_search_query(low: str, original: str) -> str:
     return q
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  DISPATCH
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def dispatch(intent: str, query: str, callbacks: dict) -> str:
     """
     Run the action. Returns a SHORT (1 sentence) spoken summary
@@ -263,9 +237,6 @@ def dispatch(intent: str, query: str, callbacks: dict) -> str:
     return "Hmm, not sure what to do with that."
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  WEB SEARCH — DuckDuckGo HTML scrape
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DDG's html.duckduckgo.com endpoint returns real organic results
 # without an API key. Format: <a class="result__a" href="...">title</a>
 # followed by <a class="result__snippet">snippet</a>.
@@ -366,9 +337,6 @@ def format_search_html(query: str, results: list[dict]) -> str:
     return "".join(parts)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CODE GENERATION — local Ollama with qwen2.5-coder
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _CODE_SYSTEM = """You are a code generator. Given a user request, respond with ONLY a JSON object:
 {"language": "<lang>", "code": "<code>", "explanation": "<one short sentence>"}
 
@@ -433,9 +401,6 @@ def generate_code(query: str) -> tuple[str, str, str]:
     return code, lang, expl
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Quick self-test  →  python skills.py "search for python tutorials"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     import sys
     test = " ".join(sys.argv[1:]) or "search for fastapi tutorial"
