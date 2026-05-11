@@ -70,3 +70,10 @@ python -m http.server 8080
 ## Stack
 
 `faster-whisper` · `Silero VAD` · `MLX-LM + Mistral-7B` · `Ollama qwen2.5-coder` · `macOS say` · `pixi-live2d-display` · `SQLite`
+
+## Credits
+
+Live2D model used in the dashboard:
+- [BOOTH.pm Model Asset](https://booth.pm/en/items/7483530?registration=1&utm_source=chatgpt.com)
+
+Used for personal/non-commercial purposes only.
