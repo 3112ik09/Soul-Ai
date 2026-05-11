@@ -29,22 +29,47 @@ html, body {
 }
 
 #app {
-  display: grid;
-  grid-template-rows: 1fr 280px;
-  grid-template-columns: 1fr;
+  display: flex;
+  flex-direction: column;
   height: 100vh;
-  gap: 0;
 }
 
 #top {
-  display: grid;
-  grid-template-columns: 420px 1fr;
+  display: flex;
+  flex: 1 1 0;
   border-bottom: 1px solid var(--border);
   min-height: 0;
 }
 
+/* ── Resizers ── */
+.resizer-h {
+  height: 6px;
+  background: var(--bg);
+  cursor: row-resize;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  z-index: 50;
+  transition: background .2s;
+}
+.resizer-h:hover, .resizer-h.active { background: var(--accent); }
+
+.resizer-v {
+  width: 6px;
+  background: var(--bg);
+  cursor: col-resize;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  flex-shrink: 0;
+  z-index: 50;
+  transition: background .2s;
+}
+.resizer-v:hover, .resizer-v.active { background: var(--accent); }
+
 /* ── Avatar panel ── */
 #avatar-panel {
+  width: 420px;
+  flex-shrink: 0;
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -93,7 +118,7 @@ html, body {
 #load-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--green)); transition: width .3s; }
 
 /* ── Chat panel ── */
-#chat-panel { display: flex; flex-direction: column; min-height: 0; }
+#chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #chat-header {
   padding: 10px 16px;
   background: var(--surface);
@@ -130,10 +155,10 @@ html, body {
 
 /* ── Bottom output ── */
 #output-panel {
-  border-top: 1px solid var(--border);
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  height: 280px;
+  display: flex;
   min-height: 0;
+  flex-shrink: 0;
 }
 
 .panel {
@@ -143,7 +168,8 @@ html, body {
   background: var(--bg);
   transition: all .25s ease;
 }
-#code-panel { border-right: 1px solid var(--border); }
+#code-panel { width: 50%; flex-shrink: 0; border-right: 1px solid var(--border); }
+#web-panel { flex: 1; min-width: 0; }
 
 .panel-header {
   padding: 8px 14px;
@@ -232,6 +258,57 @@ pre code { font-size: 12.5px !important; line-height: 1.65 !important; }
   z-index: 1000;
 }
 #conn-status { margin-left: auto; }
+
+/* ── Quick-action chips ── */
+#quick-bar {
+  padding: 7px 12px 6px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-wrap: wrap; gap: 5px;
+  flex-shrink: 0;
+}
+.chip {
+  font-size: 10px; letter-spacing: .04em;
+  padding: 3px 10px; border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #1c2128; color: var(--muted);
+  cursor: pointer; user-select: none;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.chip:hover  { background: var(--accent); color: #fff; border-color: var(--accent); }
+.chip:active { transform: scale(.95); }
+.chip.music  { border-color: #1db954; }
+.chip.music:hover  { background: #1db954; border-color: #1db954; }
+.chip.vol    { border-color: #f59e0b; }
+.chip.vol:hover    { background: #f59e0b; border-color: #f59e0b; }
+.chip.sys    { border-color: #a78bfa; }
+.chip.sys:hover    { background: #a78bfa; border-color: #a78bfa; }
+
+/* ── Text input bar ── */
+#input-bar {
+  padding: 8px 12px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: flex; gap: 7px; align-items: center;
+  flex-shrink: 0;
+}
+#cmd-input {
+  flex: 1;
+  background: #0d1117; border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text);
+  font-size: 12px; padding: 6px 12px;
+  outline: none; transition: border-color .15s;
+}
+#cmd-input:focus { border-color: var(--accent); }
+#cmd-input::placeholder { color: rgba(230,237,243,.25); }
+#cmd-send {
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 8px;
+  padding: 6px 14px; font-size: 11px;
+  cursor: pointer; transition: background .15s;
+}
+#cmd-send:hover { background: #3d6de8; }
 </style>
 </head>
 <body>
@@ -255,20 +332,49 @@ pre code { font-size: 12.5px !important; line-height: 1.65 !important; }
       </div>
     </div>
 
+    <div class="resizer-v" id="resize-top"></div>
+
     <!-- Chat -->
     <div id="chat-panel">
       <div id="chat-header">
         <span>Chat Log</span>
         <button id="clear-btn" onclick="clearChat()">Clear</button>
       </div>
+
+      <!-- Quick-action chips -->
+      <div id="quick-bar">
+        <span class="chip music" onclick="sendCmd('play music')">▶ Play</span>
+        <span class="chip music" onclick="sendCmd('pause music')">⏸ Pause</span>
+        <span class="chip music" onclick="sendCmd('next song')">⏭ Next</span>
+        <span class="chip music" onclick="sendCmd('previous song')">⏮ Prev</span>
+        <span class="chip music" onclick="sendCmd('what is playing')">♪ Now Playing</span>
+        <span class="chip vol"   onclick="sendCmd('volume up')">🔊 Vol+</span>
+        <span class="chip vol"   onclick="sendCmd('volume down')">🔉 Vol−</span>
+        <span class="chip vol"   onclick="sendCmd('mute')">🔇 Mute</span>
+        <span class="chip sys"   onclick="sendCmd('take a screenshot')">📸 Screenshot</span>
+        <span class="chip sys"   onclick="sendCmd('what is my schedule today')">📅 Schedule</span>
+        <span class="chip"       onclick="promptCmd('Search for…', 'search for ')">🔍 Search…</span>
+        <span class="chip"       onclick="promptCmd('Open app…', 'open ')">🚀 Open…</span>
+        <span class="chip"       onclick="promptCmd('Write code to…', 'write a python script to ')">💻 Code…</span>
+      </div>
+
       <div id="chat-log">
         <div class="msg siri">
           <span class="msg-label">Siri</span>
-          <div class="msg-bubble">Hey! Try saying "search for X" or "write code to Y". Click any panel below to expand it.</div>
+          <div class="msg-bubble">Hey! Use the chips above or type below to send commands. Say "Hey Siri" to use voice.</div>
         </div>
+      </div>
+
+      <!-- Typed command input -->
+      <div id="input-bar">
+        <input id="cmd-input" type="text" placeholder='Type a command or question and press Enter…'
+               onkeydown="if(event.key==='Enter') sendTyped()">
+        <button id="cmd-send" onclick="sendTyped()">Send</button>
       </div>
     </div>
   </div>
+
+  <div class="resizer-h" id="resize-h"></div>
 
   <!-- Output -->
   <div id="output-panel">
@@ -286,6 +392,8 @@ pre code { font-size: 12.5px !important; line-height: 1.65 !important; }
         <pre id="code-pre" style="display:none"><code id="code-content"></code></pre>
       </div>
     </div>
+
+    <div class="resizer-v" id="resize-bot"></div>
 
     <div id="web-panel" class="panel">
       <div class="panel-header" onclick="togglePanel('web-panel')">
@@ -477,8 +585,29 @@ function setTalking(val) {
 function setSub(text) { subtitle.textContent = text||'...'; }
 
 // ── WebSocket ──
+let _ws = null;
+
+function sendCmd(text) {
+  if (!text || !_ws || _ws.readyState !== WebSocket.OPEN) return;
+  _ws.send(JSON.stringify({ type: 'command', text }));
+}
+
+function sendTyped() {
+  const inp = document.getElementById('cmd-input');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  sendCmd(text);
+}
+
+function promptCmd(placeholder, prefix) {
+  const val = window.prompt(placeholder);
+  if (val && val.trim()) sendCmd(prefix + val.trim());
+}
+
 function connect() {
   const ws = new WebSocket(WS_URL);
+  _ws = ws;
   ws.onopen = () => {
     connEl.textContent = 'connected';
     connEl.style.color = 'rgba(255,255,255,.8)';
@@ -497,6 +626,7 @@ function connect() {
     } catch(_) {}
   };
   ws.onclose = () => {
+    _ws = null;
     connEl.textContent = 'disconnected';
     connEl.style.color = 'rgba(255,100,100,.6)';
     setTalking(false);
@@ -508,6 +638,63 @@ function connect() {
 // ── Boot ──
 loadModel();
 connect();
+
+// ── Resizers ──
+function initResizer(resizerId, panelId, isHorizontal, isPercent) {
+  const resizer = document.getElementById(resizerId);
+  const panel   = document.getElementById(panelId);
+  let isDown    = false;
+  let startPos  = 0;
+  let startSize = 0;
+
+  resizer.addEventListener('mousedown', (e) => {
+    isDown = true;
+    resizer.classList.add('active');
+    startPos  = isHorizontal ? e.clientY : e.clientX;
+    startSize = isHorizontal ? panel.offsetHeight : panel.offsetWidth;
+    document.body.style.cursor = isHorizontal ? 'row-resize' : 'col-resize';
+    // Prevent iframe/canvas pointer events from stealing drag
+    document.body.style.pointerEvents = 'none';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDown) return;
+    const currentPos = isHorizontal ? e.clientY : e.clientX;
+    const delta      = currentPos - startPos;
+    
+    // For horizontal (h-resizer), moving down decreases bottom panel height
+    // because it's attached to the top of output-panel.
+    let newSize = isHorizontal ? (startSize - delta) : (startSize + delta);
+    
+    if (isPercent) {
+      const parentSize = isHorizontal ? panel.parentElement.offsetHeight : panel.parentElement.offsetWidth;
+      newSize = (newSize / parentSize) * 100;
+      panel.style[isHorizontal ? 'height' : 'width'] = newSize + '%';
+    } else {
+      panel.style[isHorizontal ? 'height' : 'width'] = newSize + 'px';
+    }
+    
+    // Dispatch resize event so Pixi/Live2D can update if necessary
+    window.dispatchEvent(new Event('resize'));
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (!isDown) return;
+    isDown = false;
+    resizer.classList.remove('active');
+    document.body.style.cursor = 'default';
+    document.body.style.pointerEvents = 'auto';
+  });
+}
+
+// Init the 3 resizers
+// resize-h changes output-panel height (pixels)
+initResizer('resize-h', 'output-panel', true, false);
+// resize-top changes avatar-panel width (pixels)
+initResizer('resize-top', 'avatar-panel', false, false);
+// resize-bot changes code-panel width (percentage)
+initResizer('resize-bot', 'code-panel', false, true);
+
 </script>
 </body>
 </html>

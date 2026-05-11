@@ -51,9 +51,9 @@ def cancel_active():
 # Strong triggers — single word presence is usually enough
 _SEARCH_KEYWORDS = {
     # verb triggers
-    "search": 3, "google": 4, "lookup": 3, "browse": 2,
+    "search": 1, "google": 2, "lookup": 2, "browse": 1,
     # context triggers (need pairing with a verb-ish word, see logic)
-    "web": 2, "internet": 2, "online": 2,
+    "web": 1, "internet": 1, "online": 1,
     # common search intents
     "latest": 1, "news": 1, "score": 1, "weather": 1,
 }
@@ -65,10 +65,10 @@ _SEARCH_PHRASES = [
 ]
 
 _CODE_KEYWORDS = {
-    "code": 3, "script": 3, "program": 2, "function": 3, "snippet": 3,
-    "python": 2, "javascript": 2, "bash": 2, "shell": 2,
-    "typescript": 2, "rust": 2, "golang": 2,
-    "implement": 2, "algorithm": 2,
+    "code": 1, "script": 1, "program": 1, "function": 1, "snippet": 1,
+    "python": 1, "javascript": 1, "bash": 1, "shell": 1,
+    "typescript": 1, "rust": 1, "golang": 1,
+    "implement": 1, "algorithm": 1,
 }
 _CODE_PHRASES = [
     "write code", "write a code", "write me code", "write a script",
@@ -77,7 +77,14 @@ _CODE_PHRASES = [
     "generate code", "create a script", "create a function",
     "how do i code", "how do i write", "how do i implement",
     "python code", "python script", "javascript code", "js code",
-    "bash script", "shell script",
+    "bash script", "shell script", "write a python code",
+    "write some code", "can you write a python", "can you code",
+    "could you write a python code", "write a python program",
+    # natural phrasings
+    "i need code", "i need a code", "i need a script", "i need a function",
+    "i need a program", "get me code", "make me code", "make a script",
+    "make a function", "code for me", "code to", "script to", "script for",
+    "need help coding", "help me code", "help me write",
 ]
 
 # Phrases that should HARD OVERRIDE — if present, intent is locked
@@ -89,6 +96,43 @@ _HARD_CODE   = ["write code", "write a code", "write a script",
 # Negative signals — words that suggest pure chat even if a keyword is present
 _CHAT_OVERRIDES = ["how are you", "tell me about yourself",
                    "what do you think", "i feel", "i love", "i hate"]
+
+# Mac system operation scoring — weighted phrases/keywords
+# Using scores instead of binary match so compound commands
+# (e.g. "open safari and search for news") route to the dominant intent.
+_MAC_SCORE_TABLE: list[tuple[str, int]] = [
+    # Spotify — high confidence
+    ("pause music", 5), ("stop music", 5), ("next song", 5), ("next track", 5),
+    ("previous song", 5), ("previous track", 5), ("what's playing", 5), ("what is playing", 5),
+    ("current song", 5), ("play music", 5), ("play spotify", 5),
+    ("shuffle", 4), ("skip song", 4), ("skip track", 4),
+    # Volume
+    ("volume up", 5), ("volume down", 5), ("set volume", 5),
+    ("increase volume", 5), ("decrease volume", 5),
+    ("louder", 4), ("quieter", 4), ("mute", 4), ("unmute", 4),
+    # Brightness
+    ("brightness up", 5), ("brightness down", 5),
+    ("brighter", 4), ("dimmer", 4),
+    # Screenshot / calendar
+    ("screenshot", 5), ("take a screenshot", 5),
+    ("my schedule", 5), ("events today", 5),
+    # Apps (lower score — "open" appears in many non-mac sentences)
+    ("open ", 3), ("launch ", 3), ("quit ", 3), ("close ", 2),
+    # Spotify keyword alone (medium — "spotify news" should still go to search)
+    ("spotify", 3),
+]
+
+
+def _score_mac(low: str) -> int:
+    score = 0
+    for phrase, weight in _MAC_SCORE_TABLE:
+        if phrase in low:
+            score += weight
+    # "play X" where X is not generic music → likely Spotify search
+    if re.search(r"\bplay\b", low) and not re.search(
+            r"\b(music|it|resume|spotify)\b", low):
+        score += 4
+    return score
 
 
 def _score_intent(low: str, keywords: dict, phrases: list) -> int:
@@ -106,13 +150,15 @@ def _score_intent(low: str, keywords: dict, phrases: list) -> int:
 
 def route(text: str) -> tuple[str, str]:
     """
-    Returns (intent, query). intent in {'search', 'code', 'chat'}.
+    Returns (intent, query). intent in {'search', 'code', 'mac', 'chat'}.
     Uses keyword scoring across the whole sentence, not start-of-string regex.
+    Mac is scored like other intents — highest score wins — so compound
+    sentences like "open safari and search for news" route to search.
     """
     t = text.strip()
     low = t.lower()
 
-    # Hard overrides first — unambiguous phrases
+    # Hard overrides — unambiguous explicit phrases
     for ph in _HARD_SEARCH:
         if ph in low:
             q = _extract_search_query(low, t)
@@ -126,18 +172,25 @@ def route(text: str) -> tuple[str, str]:
         if ph in low:
             return "chat", t
 
-    # Score-based routing
+    # Score all intents — highest unambiguous winner takes it
+    THRESHOLD   = 3
+    mac_score    = _score_mac(low)
     search_score = _score_intent(low, _SEARCH_KEYWORDS, _SEARCH_PHRASES)
     code_score   = _score_intent(low, _CODE_KEYWORDS,   _CODE_PHRASES)
 
-    # Need a meaningful score to override chat
-    THRESHOLD = 3
+    best = max(mac_score, search_score, code_score)
 
-    if search_score >= THRESHOLD and search_score > code_score:
+    if best < THRESHOLD:
+        return "chat", t
+
+    if mac_score == best and mac_score > search_score and mac_score > code_score:
+        return "mac", t
+
+    if search_score == best and search_score >= code_score:
         q = _extract_search_query(low, t)
         return "search", q
 
-    if code_score >= THRESHOLD and code_score >= search_score:
+    if code_score >= THRESHOLD:
         return "code", t
 
     return "chat", t
@@ -199,6 +252,10 @@ def dispatch(intent: str, query: str, callbacks: dict) -> str:
             code, lang, explain = generate_code(query)
             callbacks['code_send'](code, lang, explain)
             return explain or "Done. Code is on your screen."
+
+        if intent == "mac":
+            from mac_tools import execute as mac_execute
+            return mac_execute(query)
 
     except Exception as e:
         return f"That didn't work. {str(e)[:80]}"
@@ -316,6 +373,7 @@ _CODE_SYSTEM = """You are a code generator. Given a user request, respond with O
 {"language": "<lang>", "code": "<code>", "explanation": "<one short sentence>"}
 
 Rules:
+- Default to Python unless the user specifies another language.
 - language: lowercase, one of: python, javascript, bash, typescript, go, rust, html, sql, java, cpp
 - code: complete, runnable, well-commented. No markdown fences inside the JSON string.
 - explanation: ONE sentence, max 15 words, casual tone. This will be spoken aloud.

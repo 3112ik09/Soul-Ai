@@ -20,21 +20,24 @@ import requests
 import sounddevice as sd
 from skills import route, dispatch, cancel_active as cancel_skill
 from wake_word import is_wake_word, is_stop_word, strip_wake_word
+from memory import get_memory
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OLLAMA_URL    = "http://localhost:11434"
-MODEL         = "mistral"
-WHISPER_MODEL = "base"
-SAMPLE_RATE   = 16000
-CHUNK_MS      = 32
-SILENCE_MS    = 1500
-WS_PORT       = 8765
-VOICE         = "Samantha"
-VOICE_RATE    = "150"
-VOICE_PITCH   = "[[pbas +30]]"
+OLLAMA_URL         = "http://localhost:11434"
+MODEL              = "mistral"
+WHISPER_MODEL      = "base"
+SAMPLE_RATE        = 16000
+CHUNK_MS           = 32
+SILENCE_MS         = 1500
+WS_PORT            = 8765
+VOICE              = "Samantha"
+VOICE_RATE         = "150"
+VOICE_PITCH        = "[[pbas +30]]"
+BARGE_IN_THRESHOLD = 0.75   # VAD confidence needed to interrupt bot speech
+BARGE_IN_COOLDOWN  = 1.5    # seconds after bot starts speaking before barge-in activates
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -114,15 +117,15 @@ class EmotionalState:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SHARED STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-emotion        = EmotionalState()
-input_queue    = queue.Queue()
-history        = []
-stop_speaking  = threading.Event()
-is_speaking    = threading.Event()
-avatar_clients = set()
-ws_loop        = None
-ollama_session = None
-is_awake       = False   # False = sleeping, True = listening
+emotion          = EmotionalState()
+input_queue      = queue.Queue()
+history          = []
+stop_speaking    = threading.Event()
+is_speaking      = threading.Event()
+avatar_clients   = set()
+ws_loop          = None
+is_awake         = False   # False = sleeping, True = listening
+_speak_start_time = 0.0    # used by barge-in to enforce cooldown
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  LOAD MODELS
@@ -143,27 +146,26 @@ vad_model, _ = torch.hub.load(
 print("✅ Silero VAD ready\n")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  OLLAMA PRELOAD
+#  LLM PRELOAD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def preload_ollama():
-    for m in [MODEL]:
-        try:
-            requests.post(f"{OLLAMA_URL}/api/chat", json={
-                "model": m, "messages": [{"role":"user","content":"hi"}],
-                "stream": False, "options": {"num_predict": 1}
-            }, timeout=60)
-            print(f"✅ {m} preloaded")
-        except Exception as e:
-            print(f"⚠️  Preload failed: {e}")
+print("⏳ Loading MLX model...")
+try:
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_sampler
+    llm_model, llm_tokenizer = load("./fused_model")
+    _sampler = make_sampler(temp=0.75)
+    print("✅ MLX model ready\n")
+except Exception as e:
+    print(f"❌ Failed to load MLX model: {e}")
+    sys.exit(1)
 
-def check_ollama():
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        models = [m["name"] for m in r.json().get("models", [])]
-        print(f"✅ Ollama running | Models: {', '.join(models)}")
-    except:
-        print("❌ Ollama not running → run: ollama serve")
-        sys.exit(1)
+# ── Memory ─────────────────────────────────────────────────────
+mem = get_memory()
+# Seed in-memory history with last 3 turns from previous session
+for role, content in mem.recent_turns(3):
+    history.append((role, content))
+if history:
+    print(f"✅ Memory loaded ({len(history)//2} prior turn(s))\n")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  WEBSOCKET
@@ -196,10 +198,24 @@ async def _broadcast(msg):
     avatar_clients.difference_update(dead)
 
 async def _ws_handler(ws, path=None):
+    global is_awake
     avatar_clients.add(ws)
-    print(f"Avatar connected ({len(avatar_clients)} client)")
-    try:    await ws.wait_closed()
-    finally: avatar_clients.discard(ws)
+    print(f"Dashboard connected ({len(avatar_clients)} client)")
+    try:
+        async for raw in ws:
+            try:
+                data = json.loads(raw)
+                if data.get("type") == "command":
+                    cmd = data.get("text", "").strip()
+                    if cmd:
+                        is_awake = True
+                        chat_send("user", cmd)
+                        avatar_send("thinking", False, "...")
+                        input_queue.put(cmd)
+            except Exception:
+                pass
+    finally:
+        avatar_clients.discard(ws)
 
 async def _ws_server():
     async with websockets.serve(_ws_handler, "localhost", WS_PORT):
@@ -255,9 +271,6 @@ def transcribe_and_queue(audio):
     if is_stop_word(text):
         # Stop everything immediately
         stop_speaking.set()
-        if ollama_session:
-            try: ollama_session.close()
-            except: pass
         cancel_skill()
         # Clear pending input queue so no commands fire after stop
         while not input_queue.empty():
@@ -325,13 +338,13 @@ def mic_listener():
 
             is_voice = speech_prob > 0.3
 
-            if is_speaking.is_set() and is_voice and speech_prob > 0.7:
+            # Barge-in: if the bot is speaking and VAD detects confident human speech
+            # AFTER the cooldown window (to avoid echo from speakers triggering it),
+            # interrupt immediately so the user's new utterance gets processed.
+            if (is_speaking.is_set()
+                    and speech_prob > BARGE_IN_THRESHOLD
+                    and (time.time() - _speak_start_time) > BARGE_IN_COOLDOWN):
                 stop_speaking.set()
-                if ollama_session:
-                    try: ollama_session.close()
-                    except: pass
-                cancel_skill()
-                time.sleep(0.08)
 
             if is_voice:
                 in_speech    = True
@@ -355,26 +368,24 @@ def mic_listener():
 #  LLM STREAM
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def stream_llm(user_input):
-    global ollama_session
+    sys_prompt = emotion.get_prompt()
+    mem_ctx = mem.context_block()
+    if mem_ctx:
+        sys_prompt += "\n\n" + mem_ctx
 
-    messages = [{"role":"system","content":emotion.get_prompt()}]
-    # Only last 6 turns — keeps context short and replies focused
+    # Mistral v0.3 chat template requires strictly alternating user/assistant —
+    # no system role allowed. Prepend system instructions into the first user message.
+    messages = []
     for role, content in history[-6:]:
-        messages.append({"role":role,"content":content})
-    messages.append({"role":"user","content":user_input})
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_input})
 
-    payload = {
-        "model":    MODEL,
-        "messages": messages,
-        "stream":   True,
-        "options":  {
-            "temperature":  0.75,
-            "num_ctx":      1024,
-            "num_predict":  60,    # hard cap — forces short replies
-        }
-    }
+    first_user = next((m for m in messages if m["role"] == "user"), None)
+    if first_user:
+        first_user["content"] = sys_prompt + "\n\n" + first_user["content"]
 
-    ollama_session = requests.Session()
+    prompt = llm_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
     buffer = ""
     full   = ""
     first_sent = False
@@ -383,48 +394,42 @@ def stream_llm(user_input):
 
     print(f"\n{BOT_NAME}: ", end="", flush=True)
     try:
-        with ollama_session.post(
-            f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=60
-        ) as r:
-            for line in r.iter_lines():
-                if stop_speaking.is_set():
-                    print(" [cut]", end="")
-                    break
-                if not line: continue
-                chunk = json.loads(line)
-                token = chunk.get("message",{}).get("content","")
-                print(token, end="", flush=True)
-                buffer += token
-                full   += token
+        for response in stream_generate(llm_model, llm_tokenizer, prompt, max_tokens=60,
+                                        sampler=_sampler):
+            if stop_speaking.is_set():
+                print(" [cut]", end="")
+                break
+            
+            token = response.text
+            print(token, end="", flush=True)
+            buffer += token
+            full   += token
 
-                pattern = CLAUSE_RE if not first_sent else SENTENCE_RE
-                while True:
-                    m = pattern.search(buffer)
-                    if not m: break
-                    piece  = m.group(1).strip()
-                    buffer = buffer[m.end():]
-                    if piece:
-                        first_sent = True
-                        yield piece
-                if chunk.get("done"): break
-
+            pattern = CLAUSE_RE if not first_sent else SENTENCE_RE
+            while True:
+                m = pattern.search(buffer)
+                if not m: break
+                piece  = m.group(1).strip()
+                buffer = buffer[m.end():]
+                if piece:
+                    first_sent = True
+                    yield piece
+                    
         if buffer.strip() and not stop_speaking.is_set():
             yield buffer.strip()
     except Exception as ex:
         if not stop_speaking.is_set():
             print(f"\n LLM error: {ex}")
-    finally:
-        try: ollama_session.close()
-        except: pass
-        ollama_session = None
     print()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SPEAK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def speak_chunk(text):
+    global _speak_start_time
     clean = preprocess_for_tts(text)
     if not clean: return False
+    _speak_start_time = time.time()
     proc = subprocess.Popen(
         ["say", "-v", VOICE, "-r", VOICE_RATE, VOICE_PITCH + clean]
     )
@@ -490,11 +495,28 @@ def ai_loop():
         intent, query = route(user_input)
         print(f"  Intent: {intent}  Query: {query!r}")
 
-        if intent in ("search", "code"):
+        if intent in ("search", "code", "mac"):
             stop_speaking.clear()
             is_speaking.set()
-            thinking_msg = "Searching..." if intent == "search" else "Writing code..."
-            avatar_send("thinking", False, thinking_msg)
+
+            # Enrich vague code follow-ups ("I need a Python code", "make it faster")
+            # with the last user turn so Ollama has context about WHAT to write.
+            if intent == "code" and len(query.split()) < 10:
+                for role, content in reversed(history[-6:]):
+                    if role == "user" and not content.startswith("["):
+                        query = content + ". " + query
+                        break
+
+            if intent == "search":
+                thinking_msg = "Searching the web, ek second..."
+            elif intent == "code":
+                thinking_msg = "Writing the code, check the panel in a sec..."
+            else:  # mac
+                thinking_msg = ""   # mac tools are instant — no need for a pre-message
+
+            if thinking_msg:
+                avatar_send("thinking", False, thinking_msg)
+                speak_chunk(thinking_msg)
 
             summary = dispatch(intent, query, callbacks)
 
@@ -507,8 +529,19 @@ def ai_loop():
 
             is_speaking.clear()
             stop_speaking.clear()
-            history.append(("user", user_input))
-            history.append(("assistant", summary))
+
+            if intent == "mac":
+                history.append(("user",      "[System command]"))
+                history.append(("assistant", "[Done]"))
+            elif intent == "search":
+                history.append(("user",      f"[Web search: {query}]"))
+                history.append(("assistant", "[Search results shown on screen.]"))
+            else:  # code
+                # Store the real query so follow-up requests ("make it in Python",
+                # "add error handling") know what code was originally requested.
+                history.append(("user",      query))
+                history.append(("assistant", f"[Code shown on screen. {summary}]"))
+
             chat_send("siri", summary)
             continue
 
@@ -557,21 +590,20 @@ def ai_loop():
             history.append(("assistant", clean_history_text))
             chat_send("siri", reply_text)
             update_mood(user_input, clean_history_text)
+            mem.auto_extract(user_input)
+            mem.save_exchange(user_input, clean_history_text)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ENTRY POINT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def main():
-    check_ollama()
-    threading.Thread(target=preload_ollama, daemon=True).start()
-
     print(f"""
 +---------------------------------------------------+
 |  {BOT_NAME} - Voice Assistant
 |  Wake word : "Hey Siri"
 |  Stop      : "Siri stop"
 |  STT       : faster-whisper ({WHISPER_MODEL})
-|  LLM       : {MODEL} via Ollama
+|  LLM       : Fused MLX Model (Native)
 |  TTS       : {VOICE} @ {VOICE_RATE}wpm
 |  Dashboard : http://localhost:8080/dashboard.html
 +---------------------------------------------------+

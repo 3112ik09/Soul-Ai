@@ -1,12 +1,60 @@
-venv/
+# ── Python ──────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-.env
-conversations.db
-training_data.jsonl
-*.log
-.DS_Store
-adapters/
-fused_model/
+*.pyd
+
+# ── Virtual environments ─────────────────────────────
 venv/
+.venv/
+.venv2/
+
+# ── Environment / secrets ────────────────────────────
+.env
+*.env
+
+# ── Models & adapters (too large for git) ────────────
+fused_model/
+siri-mistral/
+siri-mistral-fp16/
+siri-mistral-gguf/
+siri-human-adapters/
+adapters/
+*.safetensors
+*.gguf
+*.ggml
+*.bin
+*.pt
+*.pth
+Modelfile
+
+# ── Training data ────────────────────────────────────
+human_chat_data/
+training_data.jsonl
+train.jsonl
+valid.jsonl
+
+# ── Databases & memory ───────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Live2D assets (large binary assets) ──────────────
+live2d/
+
+# ── Logs & temp ─────────────────────────────────────
+*.log
+*.tmp
+
+# ── macOS ────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── Jupyter ──────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Scratch / old files ──────────────────────────────
+avatar.html
+avatar (2).html
+test.py
